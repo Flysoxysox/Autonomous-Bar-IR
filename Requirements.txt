@@ -1,0 +1,6 @@
+numpy
+swift-sim
+roboticstoolbox-python
+spatialgeometry
+spatialmath-python
+ir-support-full
