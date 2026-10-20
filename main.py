@@ -1,30 +1,7 @@
-import contextlib
-import os
 import sys
 import time
 import traceback
 from pathlib import Path
-
-
-@contextlib.contextmanager
-def quiet_console():
-    with open(os.devnull, 'w') as nowhere:
-        originals = []
-        for stream in (sys.stdout, sys.stderr):
-            try:
-                descriptor = stream.fileno()
-                backup = os.dup(descriptor)
-                os.dup2(nowhere.fileno(), descriptor)
-                originals.append((descriptor, backup))
-            except (OSError, ValueError):
-                continue
-        try:
-            with contextlib.redirect_stdout(nowhere), contextlib.redirect_stderr(nowhere):
-                yield
-        finally:
-            for descriptor, backup in originals:
-                os.dup2(backup, descriptor)
-                os.close(backup)
 
 
 def start_simulation():
@@ -39,10 +16,13 @@ def start_simulation():
     from RS007L import RS007L
     from scene import GlassTrayWorkcell, PEDESTAL_HEIGHT
     from pickup import TrayController, STEP_TIME
+    from A2_scene import A2Scene
 
     simulator = swift.Swift()
     try:
         simulator.launch(realtime=True)
+
+        a2_scene = A2Scene(simulator)
 
         robot = RS007L(base=SE3(0, 0, PEDESTAL_HEIGHT))
         robot.add_to_env(simulator)
@@ -56,7 +36,8 @@ def start_simulation():
         controller.dishwasher_cycle()
 
         while True:
-            time.sleep(0.25)
+            simulator.step(STEP_TIME)
+            time.sleep(STEP_TIME)
     finally:
         simulator.close()
 
@@ -64,15 +45,19 @@ def start_simulation():
 if __name__ == '__main__':
     try:
         input('Press Enter to begin')
-    except (EOFError, KeyboardInterrupt):
+    except EOFError:
+        pass  # Allow launchers without an interactive stdin to start the scene.
+    except KeyboardInterrupt:
         sys.exit(0)
 
-    with quiet_console():
-        try:
-            start_simulation()
-        except KeyboardInterrupt:
-            pass
-        except Exception:
-            error_log = Path(__file__).with_name('simulation_error.log')
-            with error_log.open('w', encoding='utf-8') as file:
-                traceback.print_exc(file=file)
+    try:
+        start_simulation()
+    except KeyboardInterrupt:
+        pass
+    except Exception:
+        traceback.print_exc()
+        error_log = Path(__file__).with_name('simulation_error.log')
+        with error_log.open('w', encoding='utf-8') as file:
+            traceback.print_exc(file=file)
+        print(f'Simulation failed. Error details saved to {error_log}', file=sys.stderr)
+        sys.exit(1)

@@ -1,0 +1,46 @@
+{
+  "source": "source/Beertap.fbx",
+  "units": "metres; native FBX scale preserved",
+  "stand_origin_in_fbx": [
+    -3.725290298461914e-09,
+    -0.052114274352788925,
+    -0.22520384192466736
+  ],
+  "hinge_in_stand": [
+    [
+      7.549790126404332e-08,
+      0.0,
+      1.0,
+      3.725290298461914e-09
+    ],
+    [
+      0.0,
+      1.0,
+      0.0,
+      0.18027427792549133
+    ],
+    [
+      -1.0,
+      0.0,
+      7.549790126404332e-08,
+      0.3945089876651764
+    ],
+    [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "hinge_axis_in_stand": [
+    1,
+    0,
+    0
+  ],
+  "closed_height": 0.5142258405685425,
+  "default_angle_limits_deg": [
+    0,
+    35
+  ],
+  "angle_note": "Visual demonstration limits, not measured mechanical stops."
+}
