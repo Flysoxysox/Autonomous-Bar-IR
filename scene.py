@@ -102,11 +102,6 @@ class GlassTrayWorkcell:
         self._add_box([0.94, 0.51, PEDESTAL_HEIGHT],
                   SE3(-0.26, -0.045, PEDESTAL_HEIGHT / 2), PEDESTAL_COLOR)
 
-        self._add_box([1.25, 0.72, BAR_HEIGHT - 0.06],
-                  SE3(0, BAR_Y, (BAR_HEIGHT - 0.06) / 2), BAR_COLOR)
-        self._add_box([1.32, 0.77, 0.06],
-                  SE3(0, BAR_Y, BAR_HEIGHT - 0.03), BAR_TOP_COLOR)
-
         self._add_box([CONVEYOR_LENGTH, CONVEYOR_WIDTH, 0.105],
                   SE3(CONVEYOR_CENTRE_X, CONVEYOR_Y, CONVEYOR_HEIGHT - 0.058),
                   CONVEYOR_BODY_COLOR)

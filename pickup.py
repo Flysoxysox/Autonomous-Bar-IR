@@ -20,8 +20,8 @@ from scene import (
 )
 
 PICKUP_ANGLES_DEGREES = [0, 22, -79, 0, 10, 0]
-STEP_TIME = 0.1
-DISPLAY_EVERY = 4
+STEP_TIME = 0.01
+DISPLAY_EVERY = 1
 
 PICKUP_HEIGHT_CORRECTION = 0.012
 PICKUP_BACKOFF = 0.015
@@ -63,11 +63,6 @@ class TrayController:
             centre = np.asarray(centre, dtype=float)
             half_size = np.asarray(size, dtype=float) / 2
             objects.append((name, centre - half_size, centre + half_size, tray))
-
-        add('bar body', (0, BAR_Y, (BAR_HEIGHT - 0.06)/2),
-            (1.25, 0.72, BAR_HEIGHT - 0.06))
-        add('bar countertop', (0, BAR_Y, BAR_HEIGHT - .03),
-            (1.32, .77, .06))
 
         add('conveyor surface', (CONVEYOR_CENTRE_X, CONVEYOR_Y, CONVEYOR_HEIGHT-.055),
             (CONVEYOR_LENGTH, CONVEYOR_WIDTH, .11))

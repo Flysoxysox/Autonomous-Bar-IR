@@ -6,7 +6,6 @@ from spatialmath import SE3
 from IR_objects import create_bar_counter
 from ir_support.robots import UR3
 from beer_tap import BeerTap
-from spatialgeometry import Cuboid
 from ir_support_extra_parts.parts import part_mesh
 
 
@@ -30,7 +29,7 @@ class A2Scene:
         self.glasses = []
 
         # ---------------- DIRTY GLASS COLLECTION ----------------
-        self.bar_table_pos = SE3.Trans(0, 1.5, 0)
+        self.bar_table_pos = SE3.Trans(0, 1.0, 0)
         self.bar_table = create_bar_counter(
             self.env,
             pose=self.bar_table_pos,
@@ -46,7 +45,7 @@ class A2Scene:
 
 
         self.person = part_mesh("personMaleCasual")
-        self.person.T = SE3.Trans(0, 2.5, 0).A @ SE3.Rz(-np.pi/2).A
+        self.person.T = SE3.Trans(0, 2.0, 0).A @ SE3.Rz(-np.pi/2).A
         self.env.add(self.person)
 
 
@@ -57,35 +56,8 @@ class A2Scene:
         self.ur3.add_to_env(self.env)
 
         # ---------------- DISHWASHING STATION ----------------
-        # Tray and glasses follow the same worktop height.
+        # Retain the former tray reference pose for callers.
         self.tray_pose = SE3(self.bar_table_offset) * SE3(0.9, -.6, 0) * SE3.Rz(np.pi / 2)
-        self.tray_color = [0.18, 0.26, 0.32, 1]
-        self.tray_rim_color = [0.22, 0.31, 0.37, 1]
-
-
-        def add_tray_box(size, position, color):
-            box = Cuboid(scale=size, color=color)
-            box.T = (self.tray_pose * SE3(*position)).A
-            self.env.add(box)
-            self.tray_parts.append(box)
-
-
-        # Three underside runners, deck and four raised rim edges.
-        for x in (-0.15, 0, 0.15):
-            add_tray_box([0.042, 0.48, 0.042], [x, 0, 0.021], self.tray_color)
-        add_tray_box([0.38, 0.48, 0.028], [0, 0, 0.056], self.tray_color)
-        for x in (-0.183, 0.183):
-            add_tray_box([0.014, 0.48, 0.022], [x, 0, 0.081], self.tray_rim_color)
-        for y in (-0.233, 0.233):
-            add_tray_box([0.352, 0.014, 0.022], [0, y, 0.081], self.tray_rim_color)
-
-        # Twelve upside-down glasses, using the same mesh and offsets as scene.py.
-        for x in (-0.118, 0, 0.118):
-            for y in (-0.171, -0.057, 0.057, 0.171):
-                glass = part_mesh("BeerGlass")
-                glass.T = (self.tray_pose * SE3(x, y, 0.22) * SE3.Rx(np.pi)).A
-                self.env.add(glass)
-                self.glasses.append(glass)
 
         # ---------------- CLEAN GLASS STATION ----------------
 
