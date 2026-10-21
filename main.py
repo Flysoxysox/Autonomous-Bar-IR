@@ -15,29 +15,26 @@ def start_simulation():
     import swift
     from spatialmath import SE3
     from RS007L import RS007L
-    from FR3 import FR3
     from scene import GlassTrayWorkcell, PEDESTAL_HEIGHT
-    from rs007l_controller import RS007LController, STEP_TIME
+    from pickup import TrayController, STEP_TIME
     from A2_scene import A2Scene
+    from handover import TrayHandover
 
     simulator = swift.Swift()
     try:
         simulator.launch(realtime=True)
         ur3_station = A2Scene(simulator, teach_pendant=False)
-        fairino = FR3(base=SE3(-0.79, 1.05, 1.0) * SE3.Rz(np.pi))
-        fairino.add_to_env(simulator)
-        fairino.set_joint_angles(np.deg2rad([0, -90, 0, 0, 90, 0]))
         kawasaki = RS007L(base=SE3(0, 0, PEDESTAL_HEIGHT))
         kawasaki.add_to_env(simulator)
         kawasaki.set_joint_angles(np.zeros(6))
 
         workcell = GlassTrayWorkcell(simulator, kawasaki)
-        controller = RS007LController(kawasaki, workcell, simulator, ur3=ur3_station.ur3)
+        controller = TrayController(kawasaki, workcell, simulator)
         simulator.set_camera_pose([2.4, 2.5, 2.2], [0.3, 0.1, 0.9])
         simulator.step(STEP_TIME)
 
         controller.dishwasher_cycle()
-        controller.handover()
+        TrayHandover(controller, ur3_station.ur3).run()
 
         while True:
             simulator.step(STEP_TIME)
@@ -59,8 +56,5 @@ if __name__ == '__main__':
             warnings.filterwarnings('ignore')
             try:
                 start_simulation()
-            except KeyboardInterrupt:
+            except (KeyboardInterrupt, Exception):
                 pass
-            except Exception:
-                import traceback
-                traceback.print_exc(file=sys.__stderr__)
