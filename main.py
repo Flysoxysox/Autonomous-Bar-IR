@@ -15,6 +15,7 @@ def start_simulation():
     import swift
     from spatialmath import SE3
     from RS007L import RS007L
+    from FR3 import FR3
     from scene import GlassTrayWorkcell, PEDESTAL_HEIGHT
     from pickup import TrayController, STEP_TIME
     from A2_scene import A2Scene
@@ -24,6 +25,9 @@ def start_simulation():
     try:
         simulator.launch(realtime=True)
         ur3_station = A2Scene(simulator, teach_pendant=False)
+        fairino = FR3(base=SE3(-0.79, 1.05, 1.0) * SE3.Rz(np.pi))
+        fairino.add_to_env(simulator)
+        fairino.set_joint_angles(np.deg2rad([0, -70, 110, 0, 0, 0]))
         kawasaki = RS007L(base=SE3(0, 0, PEDESTAL_HEIGHT))
         kawasaki.add_to_env(simulator)
         kawasaki.set_joint_angles(np.zeros(6))
