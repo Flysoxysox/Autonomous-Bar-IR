@@ -39,7 +39,7 @@ class A2Scene:
         self.bar_table_offset = self.bar_table_pos.A @ SE3.Trans(0, 0, self.table_height).A
 
         self.tap = BeerTap()
-        self.tap.set_pose(SE3(self.bar_table_offset @ SE3.Trans(0.90, 0.1, 0).A @ SE3.Rz(np.pi).A))
+        self.tap.set_pose(SE3(self.bar_table_offset) * SE3.Trans(0.90, 0.1, 0) * SE3.Rz(np.pi))
         self.tap.q = 0
         self.tap.add_to_env(self.env)
 
@@ -68,6 +68,20 @@ class A2Scene:
         if teach_pendant:
             self._add_teach_pendant()
 
+    def sync_teach_pendant(self):
+        """Read the robot's latest joints into the pendant without moving it."""
+        if not hasattr(self, "joint_slider"):
+            return
+        self.state["q"] = np.array(self.ur3.q, dtype=float, copy=True)
+        index = self.state["joint_index"]
+        self.joint_label.desc = f"Selected joint: q{index + 1}"
+        self.q_label.desc = "Joint values (rad): " + "  ".join(
+            f"q{i + 1}={value:+.2f}" for i, value in enumerate(self.state["q"])
+        )
+        self.joint_slider.min = float(self.joint_limits[0, index])
+        self.joint_slider.max = float(self.joint_limits[1, index])
+        self.joint_slider.value = float(self.state["q"][index])
+
     def _add_teach_pendant(self):
         """Add the Swift controls and callbacks for this scene's UR3."""
         self.state = {
@@ -91,14 +105,12 @@ class A2Scene:
         def update_display():
             """Update the UR3 and the joint readouts."""
             self.ur3.q = self.state["q"].copy()
-            self.joint_label.desc = f"Selected joint: q{self.state['joint_index'] + 1}"
-            self.q_label.desc = "Joint values (rad): " + "  ".join(
-                f"q{i + 1}={value:+.2f}" for i, value in enumerate(self.state["q"])
-            )
+            self.sync_teach_pendant()
 
 
         def set_joint_from_slider(value):
             """Move the selected joint within its limits."""
+            self.state["q"] = np.array(self.ur3.q, dtype=float, copy=True)
             index = self.state["joint_index"]
             self.state["q"][index] = float(np.clip(float(value), *self.joint_limits[:, index]))
             self.status_label.desc = f"Moved q{index + 1} with the slider."
@@ -109,30 +121,24 @@ class A2Scene:
             """Choose the joint controlled by the slider and nudge buttons."""
             self.state["joint_index"] = int(index)
             index = self.state["joint_index"]
-            self.joint_slider.min = float(self.joint_limits[0, index])
-            self.joint_slider.max = float(self.joint_limits[1, index])
-            self.joint_slider.value = float(self.state["q"][index])
             self.status_label.desc = f"Selected q{index + 1}."
-            update_display()
+            self.sync_teach_pendant()
 
 
         def nudge_selected_joint(amount):
             index = self.state["joint_index"]
-            set_joint_from_slider(self.state["q"][index] + amount)
-            self.joint_slider.value = float(self.state["q"][index])
+            set_joint_from_slider(self.ur3.q[index] + amount)
             self.status_label.desc = f"Nudged q{index + 1} by {amount:+.2f} rad."
 
 
         def zero_robot(_=None):
             self.state["q"][:] = np.clip(np.zeros(self.ur3.n), self.joint_limits[0], self.joint_limits[1])
-            self.joint_slider.value = float(self.state["q"][self.state["joint_index"]])
             self.status_label.desc = "Reset joints to zero within their limits."
             update_display()
 
 
         def move_to_home_pose(_=None):
             self.state["q"][:] = self.ur3_q_start
-            self.joint_slider.value = float(self.state["q"][self.state["joint_index"]])
             self.status_label.desc = "Returned to the starting pose."
             update_display()
 

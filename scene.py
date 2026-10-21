@@ -1,7 +1,7 @@
 from math import pi
 
 import numpy as np
-from spatialgeometry import Cuboid, Cylinder
+from spatialgeometry import Axes, Cuboid, Cylinder
 from spatialmath import SE3
 from ir_support_extra_parts.parts import part_mesh
 
@@ -84,6 +84,7 @@ class GlassTrayWorkcell:
         self.robot = robot
         self.tray_pose = SE3(0, BAR_Y, BAR_HEIGHT)
         self.tray_objects = []
+        self.glasses = {}  # (row, column) -> actual mesh; rows follow tray y
         self.fork_objects = []
         self._make_furniture()
         self._make_handover_box()
@@ -139,7 +140,7 @@ class GlassTrayWorkcell:
         self.tray_objects.append((shape, SE3(local_pose)))
 
     def _make_tray(self):
-
+        self.glass_axes = {}  # Keep each cup's displayed frame with its mesh.
         for x_position in RUNNER_X_POSITIONS:
             self._add_tray_box([RUNNER_WIDTH, TRAY_LENGTH, RUNNER_HEIGHT],
                                SE3(x_position, 0, RUNNER_HEIGHT / 2), TRAY_COLOR)
@@ -160,14 +161,20 @@ class GlassTrayWorkcell:
                                 RIM_THICKNESS, RIM_HEIGHT],
                                SE3(0, y_position, rim_center_height), TRAY_RIM_COLOR)
 
-        for x_position in (-0.118, 0.0, 0.118):
-            for y_position in (-0.118, 0.0, 0.118):
+        for column, x_position in enumerate((-0.118, 0.0, 0.118)):
+            for row, y_position in enumerate((-0.118, 0.0, 0.118)):
                 glass = part_mesh("BeerGlass")
                 local_pose = (SE3(x_position, y_position, deck_surface + GLASS_ORIGIN_ABOVE_DECK)
                               * SE3.Rx(pi))
                 glass.T = (self.tray_pose * local_pose).A
                 self.simulator.add(glass)
                 self.tray_objects.append((glass, local_pose))
+                self.glasses[row, column] = glass
+                # Register cup frames; main displays only the selected cup's.
+                axes = Axes(length=0.12)
+                axes.T = glass.T
+                self.tray_objects.append((axes, local_pose))
+                self.glass_axes[row, column] = axes
 
     def _add_fork_box(self, size, local_pose, color):
         mounted_pose = FORK_MOUNT * SE3(local_pose)

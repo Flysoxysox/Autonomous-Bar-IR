@@ -2,3 +2,5 @@
 __pycache__/
 *.pyc
 simulation_error.log
+test_ur3_pickup.py
+test_ur3_tap.py
