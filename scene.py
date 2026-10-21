@@ -9,8 +9,15 @@ BAR_HEIGHT = 1.00
 CONVEYOR_HEIGHT = 1.00
 PEDESTAL_HEIGHT = 0.35
 
-BAR_Y = 1.02
+HANDOVER_X = 0.48
+HANDOVER_Y = 0.405
+HANDOVER_SIZE_X = 0.44
+HANDOVER_SIZE_Y = 0.43
+HANDOVER_HEIGHT = 1.00
+
+BAR_Y = 0.92
 CONVEYOR_Y = -1.02
+CONVEYOR_VISUAL_Y = -BAR_Y
 
 CONVEYOR_LENGTH = 1.50
 CONVEYOR_START_X = -0.30
@@ -79,6 +86,7 @@ class GlassTrayWorkcell:
         self.tray_objects = []
         self.fork_objects = []
         self._make_furniture()
+        self._make_handover_box()
         self._make_tray()
         self._make_fork()
         self._make_button()
@@ -103,21 +111,28 @@ class GlassTrayWorkcell:
                   SE3(-0.26, -0.045, PEDESTAL_HEIGHT / 2), PEDESTAL_COLOR)
 
         self._add_box([CONVEYOR_LENGTH, CONVEYOR_WIDTH, 0.105],
-                  SE3(CONVEYOR_CENTRE_X, CONVEYOR_Y, CONVEYOR_HEIGHT - 0.058),
+                  SE3(CONVEYOR_CENTRE_X, CONVEYOR_VISUAL_Y, CONVEYOR_HEIGHT - 0.058),
                   CONVEYOR_BODY_COLOR)
         self._add_box([CONVEYOR_LENGTH - 0.04, CONVEYOR_WIDTH - 0.07, 0.012],
-                  SE3(CONVEYOR_CENTRE_X, CONVEYOR_Y, CONVEYOR_HEIGHT - 0.006),
+                  SE3(CONVEYOR_CENTRE_X, CONVEYOR_VISUAL_Y, CONVEYOR_HEIGHT - 0.006),
                   BELT_COLOR)
         for side_offset in (-CONVEYOR_WIDTH/2 + 0.018, CONVEYOR_WIDTH/2 - 0.018):
             self._add_box([CONVEYOR_LENGTH, 0.025, 0.065],
-                      SE3(CONVEYOR_CENTRE_X, CONVEYOR_Y + side_offset,
+                      SE3(CONVEYOR_CENTRE_X, CONVEYOR_VISUAL_Y + side_offset,
                           CONVEYOR_HEIGHT - 0.033), CONVEYOR_FRAME_COLOR)
         for x_position in (CONVEYOR_START_X + 0.12, CONVEYOR_END_X - 0.12):
             for side_offset in (-0.255, 0.255):
                 self._add_box([0.075, 0.075, CONVEYOR_HEIGHT - 0.12],
-                          SE3(x_position, CONVEYOR_Y + side_offset,
+                          SE3(x_position, CONVEYOR_VISUAL_Y + side_offset,
                               (CONVEYOR_HEIGHT - 0.12)/2), CONVEYOR_FRAME_COLOR)
 
+
+    def _make_handover_box(self):
+        self.handover_box = self._add_box(
+            [HANDOVER_SIZE_X, HANDOVER_SIZE_Y, HANDOVER_HEIGHT],
+            SE3(HANDOVER_X, HANDOVER_Y, HANDOVER_HEIGHT / 2),
+            [0.38, 0.43, 0.47, 1.0]
+        )
 
     def _add_tray_box(self, size, local_pose, color):
         shape = self._add_box(size, self.tray_pose * local_pose, color)
@@ -161,8 +176,10 @@ class GlassTrayWorkcell:
 
     def _make_fork(self):
 
-        self._add_fork_box([0.23, 0.070, 0.065],
-                           SE3(0, 0.035, 0.0), PEDESTAL_COLOR)
+        self._add_fork_box([0.028, 0.100, 0.012],
+                           SE3(0, 0.050, -0.025), PEDESTAL_COLOR)
+        self._add_fork_box([0.190, 0.018, 0.007],
+                           SE3(0, 0.101, -0.025), PEDESTAL_COLOR)
         for x_position in FORK_X_POSITIONS:
             self._add_fork_box([FORK_WIDTH, FORK_LENGTH, FORK_THICKNESS],
                                SE3(x_position, 0.065 + FORK_LENGTH / 2, -0.025),
@@ -224,21 +241,21 @@ class GlassTrayWorkcell:
 
         for direction in (-1, 1):
             self._add_box([length, 0.035, wall_height],
-                          SE3(centre_x, CONVEYOR_Y + direction * side_y, wall_centre), metal)
+                          SE3(centre_x, CONVEYOR_VISUAL_Y + direction * side_y, wall_centre), metal)
 
         self._add_box([length, DISHWASHER_WIDTH + 0.035, 0.045],
-                      SE3(centre_x, CONVEYOR_Y, DISHWASHER_TOP + 0.0225), metal)
+                      SE3(centre_x, CONVEYOR_VISUAL_Y, DISHWASHER_TOP + 0.0225), metal)
         self._add_box([0.04, DISHWASHER_WIDTH + 0.035, wall_height],
-                      SE3(DISHWASHER_BACK_X - 0.02, CONVEYOR_Y, wall_centre), metal)
+                      SE3(DISHWASHER_BACK_X - 0.02, CONVEYOR_VISUAL_Y, wall_centre), metal)
 
         rail_height = CONVEYOR_HEIGHT + DOOR_HEIGHT + DOOR_RISE
         for direction in (-1, 1):
             self._add_box([0.06, 0.06, rail_height],
-                          SE3(DISHWASHER_FRONT_X, CONVEYOR_Y + direction * (side_y + 0.0175),
+                          SE3(DISHWASHER_FRONT_X, CONVEYOR_VISUAL_Y + direction * (side_y + 0.0175),
                               rail_height / 2), dark)
 
         self.door = self._add_box([0.034, DISHWASHER_WIDTH - 0.02, DOOR_HEIGHT],
-                                  SE3(DISHWASHER_FRONT_X, CONVEYOR_Y, DOOR_CLOSED_CENTRE),
+                                  SE3(DISHWASHER_FRONT_X, CONVEYOR_VISUAL_Y, DOOR_CLOSED_CENTRE),
                                   [0.24, 0.48, 0.67, 1])
         self.door_open = False
         self.door_fraction = 0.0
@@ -248,7 +265,7 @@ class GlassTrayWorkcell:
         target = 1.0 if opened else 0.0
         for fraction in np.linspace(start, target, frames):
             self.door_fraction = float(fraction)
-            self.door.T = SE3(DISHWASHER_FRONT_X, CONVEYOR_Y,
+            self.door.T = SE3(DISHWASHER_FRONT_X, CONVEYOR_VISUAL_Y,
                               DOOR_CLOSED_CENTRE + DOOR_RISE * self.door_fraction).A
             self.simulator.step(step_time)
         self.door_open = bool(opened)

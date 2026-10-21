@@ -4,7 +4,7 @@ import swift
 import numpy as np
 from spatialmath import SE3
 from IR_objects import create_bar_counter
-from ir_support.robots import UR3
+from ir_support.robots import UR3e
 from beer_tap import BeerTap
 from ir_support_extra_parts.parts import part_mesh
 
@@ -39,7 +39,7 @@ class A2Scene:
         self.bar_table_offset = self.bar_table_pos.A @ SE3.Trans(0, 0, self.table_height).A
 
         self.tap = BeerTap()
-        self.tap.set_pose(SE3(self.bar_table_offset @ SE3.Trans(0.5, 0.1, 0).A @ SE3.Rz(np.pi).A))
+        self.tap.set_pose(SE3(self.bar_table_offset @ SE3.Trans(0.90, 0.1, 0).A @ SE3.Rz(np.pi).A))
         self.tap.q = 0
         self.tap.add_to_env(self.env)
 
@@ -49,9 +49,9 @@ class A2Scene:
         self.env.add(self.person)
 
 
-        self.ur3_q_start = np.deg2rad([0, -75, 150.0, -180, 90, 45.6])
-        self.ur3 = UR3()
-        self.ur3.base = self.bar_table_offset @ SE3.Trans(0.85, -0.2, 0).A
+        self.ur3_q_start = np.deg2rad([180, 0, 0, -90, 90, 0])
+        self.ur3 = UR3e()
+        self.ur3.base = self.bar_table_offset @ SE3.Trans(0.50, -0.28, 0).A
         self.ur3.q = self.ur3_q_start
         self.ur3.add_to_env(self.env)
 

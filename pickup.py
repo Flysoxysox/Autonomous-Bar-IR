@@ -20,8 +20,8 @@ from scene import (
 )
 
 PICKUP_ANGLES_DEGREES = [0, 22, -79, 0, 10, 0]
-STEP_TIME = 0.01
-DISPLAY_EVERY = 1
+STEP_TIME = 0.005
+DISPLAY_EVERY = 12
 
 PICKUP_HEIGHT_CORRECTION = 0.012
 PICKUP_BACKOFF = 0.015
@@ -175,7 +175,7 @@ class TrayController:
                         return f'robot link {index} near {name}'
 
         transform = self.wrist_pose(joint_angles) @ FORK_MOUNT.A
-        boxes = [([0, .035, 0], [.23, .070, .065], 'fork mounting box')]
+        boxes = [([0, .0525, -.010], [.23, .035, .018], 'fork mounting box')]
         for x_position in FORK_X_POSITIONS:
             boxes.append(([x_position, .065 + FORK_LENGTH/2, -.025],
                           [FORK_WIDTH, FORK_LENGTH, FORK_THICKNESS], 'fork prong'))
@@ -306,7 +306,7 @@ class TrayController:
         print('Planning collision-checked approach and RMRC insertion...')
         pickup_joint_angles = np.deg2rad(PICKUP_ANGLES_DEGREES)
         target = self.tool_pose(pickup_joint_angles)
-        target[:3,3] += [0, -PICKUP_BACKOFF, PICKUP_HEIGHT_CORRECTION]
+        target[:3,3] += [0, -PICKUP_BACKOFF + (BAR_Y - 1.02), PICKUP_HEIGHT_CORRECTION]
         insertion_joint_angles = self._solve_inverse_kinematics(target, pickup_joint_angles, 'aligned insertion pose')
 
         staging = target.copy()
@@ -350,8 +350,8 @@ class TrayController:
             return
         if not np.isclose(CONVEYOR_HEIGHT, BAR_HEIGHT, atol=1e-6):
             raise MotionPlanningError('Placement assumes matching bar and conveyor heights.')
-        if not np.isclose(CONVEYOR_Y, -BAR_Y, atol=1e-6):
-            raise MotionPlanningError('Placement assumes conveyor loading position behind the bar.')
+        if abs(-BAR_Y - CONVEYOR_Y) + TRAY_LENGTH/2 >= (CONVEYOR_WIDTH - 0.07)/2:
+            raise MotionPlanningError('Mirrored tray position would overhang the conveyor belt.')
 
         lifted_joint_angles = np.asarray(self.robot.q, dtype=float).copy()
 
@@ -377,7 +377,7 @@ class TrayController:
         self.check_trajectory(lowering_path, carrying=True, label='level lowering')
 
         final_tray_pose = self.wrist_pose(lowering_path[-1]) @ self.tray_offset_from_wrist
-        target_position = np.array([0.0, CONVEYOR_Y, CONVEYOR_HEIGHT])
+        target_position = np.array([0.0, -BAR_Y, CONVEYOR_HEIGHT])
         if np.linalg.norm(final_tray_pose[:3, 3] - target_position) > .008:
             raise MotionPlanningError(
                 f'Predicted tray position {np.round(final_tray_pose[:3,3], 3)} '
@@ -587,7 +587,7 @@ class TrayController:
     def collect_clean_tray(self):
         if not self.washed or self.scene.door_open is False:
             raise MotionPlanningError('Dishwasher must finish and door must be open')
-        if np.linalg.norm(self.scene.tray_pose.t - [0, CONVEYOR_Y, CONVEYOR_HEIGHT]) > .008:
+        if np.linalg.norm(self.scene.tray_pose.t - [0, -BAR_Y, CONVEYOR_HEIGHT]) > .008:
             raise MotionPlanningError('Tray is not at the loading position')
         if self.rear_pickup_paths is None:
             raise MotionPlanningError('Missing return pickup trajectory')
