@@ -25,6 +25,11 @@ LIGHT_CURTAIN_HALF_SPAN = 1.04
 # Relative to the main worktop frame; base rests on the raised tabletop.
 ACTIVATION_LIGHT_POSE = SE3.Trans(-0.75, 0.25, 0.30)
 
+BARRIER_LENGTH = 1.50
+FENCE_SIDE_X = 2.20
+FENCE_REAR_Y = -2.20
+FENCE_FRONT_Y = 0.65
+
 
 class A2Scene:
     """Add all scene objects to an existing Swift environment.
@@ -96,6 +101,10 @@ class A2Scene:
         self.tap.add_to_env(self.env)
 
 
+        self.safety_parts = {}
+        self._add_safety_barriers()
+        self._add_safety_equipment()
+
         self.person = part_mesh("personMaleCasual")
         self.person.T = SE3.Trans(0, 2.2, 0).A @ SE3.Rz(-np.pi/2).A
         self.env.add(self.person)
@@ -116,6 +125,50 @@ class A2Scene:
         self.fr3.add_to_env(self.env)
 
         self.tray_pose = SE3(self.bar_table_offset) * SE3(0.9, -.6, 0) * SE3.Rz(np.pi / 2)
+
+    def _add_safety_part(self, name, model, pose):
+        shape = part_mesh(model, pose=pose)
+        self.env.add(shape)
+        self.safety_parts[name] = shape
+        return shape
+
+    def _add_safety_barriers(self):
+        for index, x in enumerate((-BARRIER_LENGTH, 0.0, BARRIER_LENGTH)):
+            self._add_safety_part(
+                f"rear_barrier_{index}", "barrier1.5x0.2x1m",
+                SE3(x, FENCE_REAR_Y, 0),
+            )
+
+        for side, x in (("left", -FENCE_SIDE_X), ("right", FENCE_SIDE_X)):
+            for index, y in enumerate((-1.45, 0.05)):
+                self._add_safety_part(
+                    f"{side}_barrier_{index}", "barrier1.5x0.2x1m",
+                    SE3(x, y, 0) * SE3.Rz(np.pi / 2),
+                )
+
+        for side, x in (("left", -1.60), ("right", 1.60)):
+            self._add_safety_part(
+                f"{side}_front_return", "barrier1.5x0.2x1m",
+                SE3(x, FENCE_FRONT_Y, 0),
+            )
+
+    def _add_safety_equipment(self):
+        for side, x in (("left", -1.60), ("right", 1.60)):
+            self._add_safety_part(
+                f"{side}_emergency_stop", "emergencyStopWallMounted",
+                SE3(x, 0.78, 1.05),
+            )
+
+        self._add_safety_part(
+            "warning_sign", "WarningSign", SE3(-1.45, 1.72, 0),
+        )
+        self._add_safety_part(
+            "caution_sign", "CautionSign", SE3(1.45, 1.72, 0),
+        )
+        self._add_safety_part(
+            "fire_extinguisher", "FireExtinguisher",
+            SE3(-2.48, -1.15, 0),
+        )
 
     def set_safety_light(self, colour):
         if colour == self.safety_light_colour:
