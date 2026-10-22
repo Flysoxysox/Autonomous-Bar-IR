@@ -114,7 +114,7 @@ class TrayHandover:
                     motion.obstacles = old_obstacles + extra_obstacles
         raise MotionPlanningError('No safe swing-back handover route: ' + '; '.join(failures))
 
-    def run(self):
+    def sequence(self):
         motion = self.controller
         if not motion.carrying_tray or not motion.wash_complete:
             raise MotionPlanningError('The Kawasaki must first collect the washed tray')
@@ -187,9 +187,11 @@ class TrayHandover:
             if square_error > np.deg2rad(1):
                 raise MotionPlanningError('Tray is not square to the handover box')
 
-            for path in (preparation_path, raise_path, swivel_path,
-                         *handover_paths):
-                motion._animate_path(path, carrying=True)
+            paths = [preparation_path, raise_path, swivel_path, *handover_paths]
+            self.return_paths = [path[::-1].copy() for path in reversed(paths)]
+            self.saved_offset = motion.tray_offset_from_wrist.copy()
+            for index, path in enumerate(paths):
+                yield motion._segment(f"HANDOVER_{index + 1}", path, carrying=True)
 
             motion.scene.set_tray_pose(SE3(final_pose))
             motion.carrying_tray = False
@@ -204,3 +206,43 @@ class TrayHandover:
         except Exception:
             motion.obstacles = old_obstacles
             raise
+
+    def return_sequence(self):
+        motion = self.controller
+        if motion.carrying_tray or not motion.tray_placed or not hasattr(self, "return_paths"):
+            raise MotionPlanningError("No completed handover route is available for return")
+        if np.max(np.abs(motion.robot.q - self.return_paths[0][0])) > 1e-6:
+            raise MotionPlanningError("Kawasaki has moved since releasing the handover tray")
+        motion.tray_offset_from_wrist = np.linalg.inv(motion.wrist_pose(motion.robot.q)) @ motion.scene.tray_pose.A
+        motion.carrying_tray = True
+        # retrace the validated handover route before swivelling to the original pickup
+        obstacles = motion._build_obstacles()
+        motion.obstacles = [item for item in obstacles if not item[3]]
+        try:
+            for index, path in enumerate(self.return_paths):
+                motion.check_trajectory(path, carrying=True, label=f"return handover {index}")
+            pickup = motion.original_pickup_paths
+            swivel = jtraj(self.return_paths[-1][-1], pickup["lift"][-1], 200).q
+            motion.check_trajectory(swivel, carrying=True, label="return swivel")
+            lowering = pickup["lift"][::-1].copy()
+            motion.check_trajectory(lowering, carrying=True, label="return lowering")
+            final_pose = motion.wrist_pose(lowering[-1]) @ motion.tray_offset_from_wrist
+            if np.linalg.norm(final_pose[:3, 3] - [0, 0.92, 1.00]) > 0.004:
+                raise MotionPlanningError("Return route does not reach the original tray position")
+            for index, path in enumerate([*self.return_paths, swivel, lowering]):
+                yield motion._segment(f"RETURN_TRAY_{index + 1}", path, carrying=True)
+            motion.carrying_tray = False
+            motion.tray_offset_from_wrist = None
+            motion.obstacles = motion._build_obstacles()
+            for name in ("contact", "insertion"):
+                path = pickup[name][::-1].copy()
+                motion.check_trajectory(path, label=f"return fork {name}")
+                yield motion._segment(f"RETURN_FORK_{name.upper()}", path)
+            motion.tray_placed = False
+            motion.conveyor_finished = motion.washed = motion.wash_complete = False
+        finally:
+            motion.obstacles = motion._build_obstacles()
+
+    def run(self):
+        # retain the old entry point while using update based playback
+        self.controller.start_sequence(self.sequence())

@@ -1,25 +1,33 @@
 /* keep the standard swift controls compact */
 div[class*="SwiftBar-module_sidenav"] { padding-top: 8px !important; }
-div[class*="SwiftBar-module_labelDiv"] { margin: 5px 0 !important; text-align: left !important; }
-div[class*="SwiftBar-module_labelDiv"] p { font-size: 13px !important; font-weight: normal !important; }
-div[class*="SwiftBar-module_buttonDiv"] { margin: 5px 0 !important; }
-button[class*="SwiftBar-module_buttonButton"] { font-size: 13px !important; height: 30px !important; }
+div[class*="SwiftBar-module_labelDiv"] { margin: 3px 0 !important; text-align: left !important; }
+div[class*="SwiftBar-module_labelDiv"] p { font-size: 12px !important; font-weight: normal !important; }
+div[class*="SwiftBar-module_buttonDiv"] {
+    display: inline-flex !important;
+    width: 50% !important;
+    margin: 3px 0 !important;
+    padding-right: 4px !important;
+    box-sizing: border-box !important;
+}
+button[class*="SwiftBar-module_buttonButton"] {
+    font-size: 11px !important;
+    min-height: 26px !important;
+    height: auto !important;
+    padding: 4px 5px !important;
+    line-height: 1.2 !important;
+    width: 100% !important;
+    white-space: normal !important;
+    box-sizing: border-box !important;
+}
 div[class*="SwiftBar-module_sliderDiv"], div[class*="SwiftBar-module_selectDiv"] { margin: 9px 0 !important; }
 p[class*="SwiftBar-module_sliderP"] { margin-bottom: 7px !important; font-size: 13px !important; }
 div[class*="SwiftBar-module_sliderValDiv"] { margin-top: 7px !important; font-size: 12px !important; }
 input[class*="SwiftBar-module_slider"]::-webkit-slider-thumb { width: 17px !important; height: 17px !important; }
 
-/* the third action is the stop button, after the five state readouts */
-div[class*="SwiftBar-module_sidenav"] > div:nth-child(8) button {
+/* use the button label rather than its position so new controls do not break styling */
+button[data-safety="estop"] {
     background: #a52727 !important;
     font-weight: bold;
-}
-
-/* joint, position and rotation controls use compact pairs */
-div[class*="SwiftBar-module_sidenav"] > div[class*="SwiftBar-module_buttonDiv"]:nth-last-child(-n+15):not(:last-child) {
-    display: inline-flex !important;
-    width: 50% !important;
-    margin: 3px 0 !important;
 }
 
 /* release is sent by the pointer handler rather than a visible button */

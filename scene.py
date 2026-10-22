@@ -1,9 +1,19 @@
 from math import pi
+from xml.etree import ElementTree
 
 import numpy as np
 from spatialgeometry import Axes, Cuboid, Cylinder
 from spatialmath import SE3
-from ir_support_extra_parts.parts import part_mesh
+from ir_support_extra_parts.parts import part_mesh, part_path
+
+
+def glass_bounds():
+    # the packaged upright mesh has an identity scene transform and metre units
+    root = ElementTree.parse(part_path("BeerGlass")).getroot()
+    ns = {"c": "http://www.collada.org/2005/11/COLLADASchema"}
+    source = root.find(".//c:source[@id='BeerGlasses-mesh-positions']/c:float_array", ns)
+    vertices = np.fromstring(source.text, sep=" ").reshape(-1, 3)
+    return vertices.min(axis=0), vertices.max(axis=0)
 
 BAR_HEIGHT = 1.00
 CONVEYOR_HEIGHT = 1.00
@@ -97,7 +107,7 @@ class GlassTrayWorkcell:
         self.update_fork()
 
         print(f"Workcell ready: bar {BAR_HEIGHT:.2f} m, conveyor {CONVEYOR_HEIGHT:.2f} m, pedestal {PEDESTAL_HEIGHT:.2f} m")
-        print("Tray: 9 inverted BeerGlass meshes, two underside channels")
+        print("Tray: two BeerGlass meshes and nine slots with two underside channels")
         print("Forks follow the wrist; tray starts on the bar until the pick command")
 
     def _add_box(self, size, pose, color):
@@ -164,6 +174,8 @@ class GlassTrayWorkcell:
 
         for column, x_position in enumerate((-0.118, 0.0, 0.118)):
             for row, y_position in enumerate((-0.118, 0.0, 0.118)):
+                if (row, column) not in ((1, 2), (2, 2)):
+                    continue
                 glass = part_mesh("BeerGlass")
                 local_pose = (SE3(x_position, y_position, deck_surface + GLASS_ORIGIN_ABOVE_DECK)
                               * SE3.Rx(pi))
@@ -176,6 +188,35 @@ class GlassTrayWorkcell:
                 axes.T = glass.T
                 self.tray_objects.append((axes, local_pose))
                 self.glass_axes[row, column] = axes
+
+    def occupied_slots(self):
+        return {cell for cell, glass in self.glasses.items() if any(shape is glass for shape, _ in self.tray_objects)}
+
+    def free_slot(self):
+        occupied = self.occupied_slots()
+        # fill the farthest positive x column before moving towards negative x
+        for column in (2, 1, 0):
+            for row in range(3):
+                if (row, column) not in occupied and not any(c < column for _, c in occupied):
+                    return row, column
+        return None
+
+    def slot_pose(self, cell):
+        _, upper = glass_bounds()
+        row, column = cell
+        # turn the glass upside down with its rim resting on the tray deck
+        return self.tray_pose * SE3((column - 1) * 0.118, (row - 1) * 0.118, RUNNER_HEIGHT + DECK_THICKNESS + upper[2]) * SE3.Rx(pi)
+
+    def register_glass(self, cell, glass):
+        if cell in self.occupied_slots():
+            raise RuntimeError(f"Tray slot {cell} is occupied")
+        self.glasses[cell] = glass
+        local_pose = self.tray_pose.inv() * SE3(glass.T)
+        self.tray_objects.append((glass, local_pose))
+        axes = Axes(length=0.12)
+        axes.T = glass.T
+        self.glass_axes[cell] = axes
+        self.tray_objects.append((axes, local_pose))
 
     def _add_fork_box(self, size, local_pose, color):
         mounted_pose = FORK_MOUNT * SE3(local_pose)

@@ -22,6 +22,9 @@ from scene import (
 )
 
 STEP_TIME = 0.005
+# movement durations in seconds; increase these values to slow the mechanisms down
+DOOR_MOVE_TIME = 2.0
+CONVEYOR_MOVE_TIME = 4.0
 PICKUP_ANGLES_DEGREES = [0, 22, -79, 0, 10, 0]
 PICKUP_HEIGHT_CORRECTION = 0.012
 PICKUP_BACKOFF = 0.015
@@ -189,9 +192,16 @@ class RS007LController:
             link_start, link_end = frames[index][:3, 3], frames[index+1][:3, 3]
             link_radius = .037 if index in (2, 3, 4) else .028
             sample_count = max(3, int(np.linalg.norm(link_end-link_start)/.025) + 1)
+            # a link cannot touch an obstacle outside its bounds, including its radius
+            link_min = np.minimum(link_start, link_end) - link_radius
+            link_max = np.maximum(link_start, link_end) + link_radius
+            nearby_obstacles = [o for o in obstacles
+                                if not (np.any(link_max < o[1]) or np.any(link_min > o[2]))]
+            if not nearby_obstacles:
+                continue
             for t in np.linspace(0, 1, sample_count):
                 point = link_start * (1-t) + link_end * t
-                for name, min_corner, max_corner, _ in obstacles:
+                for name, min_corner, max_corner, _ in nearby_obstacles:
                     if self._sphere_intersects_box(point, link_radius, min_corner, max_corner):
                         return f'robot link {index} near {name}'
 
@@ -595,6 +605,7 @@ class RS007LController:
             "contact": contact.copy(),
             "lift": lift.copy(),
         }
+        self.original_pickup_paths = {name: path.copy() for name, path in self.pickup_paths.items()}
         yield self._segment("APPROACH_TRAY", approach)
         yield self._segment("INSERT_FORKS", insertion)
         yield self._segment("CONTACT_TRAY", contact)
@@ -690,13 +701,14 @@ class RS007LController:
         release = yield from self._button_press_sequence("blue")
         start = float(self.scene.door_fraction)
         target = 1.0 if open_door else 0.0
-        for fraction in np.linspace(start, target, 16):
+        steps = max(1, int(np.ceil(DOOR_MOVE_TIME / self.dt)))
+        for fraction in np.linspace(start, target, steps + 1)[1:]:
             self.scene.door_fraction = float(fraction)
             self.scene.door.T = SE3(
                 DISHWASHER_FRONT_X, -BAR_Y,
                 DOOR_CLOSED_CENTRE + DOOR_RISE * fraction,
             ).A
-            yield self._segment("OPEN_DOOR" if open_door else "CLOSE_DOOR")
+            yield self._segment("OPEN_DOOR" if open_door else "CLOSE_DOOR", wait_time=self.dt)
         self.scene.door_open = bool(open_door)
         yield from self._button_release_sequence("blue", release)
 
@@ -723,12 +735,13 @@ class RS007LController:
             raise MotionPlanningError("Tray would hit dishwasher back")
 
         release = yield from self._button_press_sequence("green")
-        for progress in np.linspace(0, 1, 30):
+        steps = max(1, int(np.ceil(CONVEYOR_MOVE_TIME / self.dt)))
+        for progress in np.linspace(0, 1, steps + 1)[1:]:
             smooth = progress**2 * (3 - 2 * progress)
             pose = start.copy()
             pose[0, 3] = start[0, 3] * (1 - smooth) + target_x * smooth
             self.scene.set_tray_pose(SE3(pose))
-            yield self._segment("CONVEY_IN" if forward else "CONVEY_OUT")
+            yield self._segment("CONVEY_IN" if forward else "CONVEY_OUT", wait_time=self.dt)
         self.obstacles = self._build_obstacles()
         yield from self._button_release_sequence("green", release)
         self.conveyor_finished = forward
@@ -820,5 +833,15 @@ class RS007LController:
         self.change_state("CONVEY_IN")
 
     def dishwasher_cycle(self):
-
+        if self.state != "IDLE" or self.carrying_tray:
+            raise MotionPlanningError("Kawasaki must be idle at the original pickup")
+        self.tray_placed = False
+        self.conveyor_finished = self.washed = self.wash_complete = False
+        self.obstacles = self._build_obstacles()
         self.change_state("DISHWASHER_CYCLE")
+
+    def start_sequence(self, sequence):
+        if self.stopped or self.state != "IDLE" or self._sequence is not None:
+            raise MotionPlanningError("Kawasaki cannot accept another action")
+        self._sequence = sequence
+        self._advance_state()

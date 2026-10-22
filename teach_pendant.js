@@ -2,6 +2,16 @@
 (() => {
     let activeButton = null;
 
+    function markSafetyButton() {
+        for (const button of document.querySelectorAll("button")) {
+            if (["E-STOP", "RELEASE E-STOP"].includes(button.textContent.trim())) {
+                button.dataset.safety = "estop";
+            }
+        }
+    }
+    new MutationObserver(markSafetyButton).observe(document.body, { childList: true, subtree: true });
+    markSafetyButton();
+
     function jogButton(target) {
         const button = target.closest?.("button");
         return button && /^[+-](?:R?[XYZ]|q)$/i.test(button.textContent.trim()) ? button : null;

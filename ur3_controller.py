@@ -396,52 +396,59 @@ class UR3Controller:
         self.tr_ee_held_glass = None
 
     def plan_rmrc(self, target_pose, steps=100, q_start=None, tool_offset=None):
-        """Plan joint samples using Cartesian velocity and the world Jacobian."""
+        """Use RMRC and Damped Least Squares to follow a Cartesian trajectory."""
+        # 1: Assign parameters for RMRC
         if steps < 2:
             raise ValueError("RMRC needs at least two samples")
+        delta_t = self.dt  # Discrete time step
+        min_manip_measure = self.min_manip_measure  # Threshold for MoM
+        m = np.zeros([1, steps - 1])  # Assign memory to store MoM
+        error = np.empty([6, steps - 1])  # Assign memory to record velocity error
+
         if q_start is None:
             q_start = self.ur3.q
-        q_matrix = np.zeros((steps, self.ur3.n))
-        q_matrix[0] = q_start
+
+        # 2: Create a Cartesian trajectory for the robot end-effector to follow
         if tool_offset is None:
-            # cartesian interpolation gives a straight position path and a smooth orientation change
             poses = rtb.ctraj(self.ur3.fkine(q_start), target_pose, steps)
         else:
-            # make the attached cup follow the straight line even while it turns
+            # Make the attached cup follow the straight line even while it turns
             cup_start = self.ur3.fkine(q_start) * tool_offset
             cup_poses = rtb.ctraj(cup_start, target_pose, steps)
-            # convert each cup pose into the matching end effector pose for rmrc
+            # Convert each cup pose into the matching end-effector pose
             offset_inverse = tool_offset.inv()
             poses = [pose * offset_inverse for pose in cup_poses]
 
+        # 3: Start from the current joint angles (no initial IK move is needed)
+        q_matrix = [np.array(q_start, dtype=float, copy=True)]
+
+        # 4: Use RMRC to solve joint velocities at each time step
         for i in range(steps - 1):
             actual = self.ur3.fkine(q_matrix[i])
             desired = poses[i + 1]
-            # divide position and rotation errors by the sample time to get desired velocities
-            # both errors are in world coordinates to match the world frame jacobian
-            # the rotation vector gives the rotation axis scaled by the angle in radians
+            # Calculate velocity at discrete time step, correcting any tracking error
+            # Include world-frame rotation velocity for the six-axis robot
             xdot = np.r_[
                 desired.t - actual.t,
                 Rotation.from_matrix(desired.R @ actual.R.T).as_rotvec(),
-            ] / self.dt
-            J = self.ur3.jacob0(q_matrix[i])
-            # the jacobian maps joint velocities to end effector velocities
-            # the product of its singular values measures how freely the arm can move
-            m = np.prod(linalg.svdvals(J))
+            ] / delta_t
+            J = self.ur3.jacob0(q_matrix[i])  # Get the Jacobian at the current state
+            # Clamp small negative determinants caused by floating-point rounding
+            m[:, i] = np.sqrt(max(0.0, linalg.det(J @ J.T)))  # MoM
 
-            # damping limits very large joint velocities near a singularity
-            if m < self.min_manip_measure:
-                damping = 0.01
-                qdot = linalg.solve(
-                    J.T @ J + damping**2 * np.eye(self.ur3.n), J.T @ xdot,
-                )
+            # Apply Damped Least Squares for configurations with low manipulability
+            if m[0, i] < min_manip_measure:
+                qdot = linalg.inv(J.T @ J + 0.01**2 * np.eye(self.ur3.n)) @ J.T @ xdot
             else:
-                # least squares finds joint velocities that best match the requested motion
-                qdot = linalg.lstsq(J, xdot)[0]
-            # integrate joint velocity over one sample to find the next joint angles
-            q_matrix[i + 1] = q_matrix[i] + self.dt * qdot
+                qdot = linalg.inv(J) @ xdot  # Solve velocities via RMRC
 
-        return q_matrix
+            error[:, i] = xdot - J @ qdot  # Calculate and store velocity error
+            q_matrix.append(q_matrix[i] + delta_t * qdot)  # Update next joint state
+
+        # 5: Store manipulability and velocity error for inspection or plotting
+        self.rmrc_manipulability = m
+        self.rmrc_velocity_error = error
+        return np.asarray(q_matrix)
 
     def plan_tap_rotation(self, target_angle, steps=200):
         """Plan matching arm and handle samples for opening or closing."""

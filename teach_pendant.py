@@ -20,12 +20,18 @@ class TeachPendant:
         self._read_joint_limits()
 
         self.state_labels = {}
-        for name in ("Program", "UR3", "Kawasaki", "Dirty glasses", "Beers requested"):
+        for name in ("Program", "Safety", "UR3", "Kawasaki", "FR3", "Dirty glasses", "Beers requested"):
             self.state_labels[name] = swift.Label("")
             env.add(self.state_labels[name])
         env.add(swift.Button(self.request_beer, desc="Request beer"))
         env.add(swift.Button(self.deposit_dirty_glass, desc="Deposit dirty glass"))
-        env.add(swift.Button(self.stop_all, desc="STOP"))
+        env.add(swift.Button(lambda _: self.control.request_wash() if self.control else None, desc="Run wash cycle"))
+        env.add(swift.Button(lambda _: self.control.request_return() if self.control else None, desc="Return tray"))
+        self.estop_button = swift.Button(self.stop_all, desc="E-STOP")
+        env.add(self.estop_button)
+        env.add(swift.Button(self.reset, desc="RESET"))
+        self.manual_button = swift.Button(self.toggle_manual, desc="MANUAL")
+        env.add(self.manual_button)
         self.pause_button = swift.Button(self.toggle_pause, desc="PAUSE")
         env.add(self.pause_button)
         self.status_label = swift.Label("Hold a jog button to move")
@@ -78,20 +84,38 @@ class TeachPendant:
             states["Program"] = "MANUAL"
             states[self.robot_names[self.robot_index]] = "JOGGING"
         for name, value in states.items():
-            text = f"{name}: {value}"
+            # keep the system state separate from each robot's task or recovery state
+            if name == "Program":
+                title = "System state"
+            elif name in self.robot_names:
+                title = f"{name} state"
+            else:
+                title = name
+            text = f"{title}: {value}"
             if self.state_labels[name].desc != text:
                 self.state_labels[name].desc = text
         if self.control is not None:
+            self.estop_button.desc = "RELEASE E-STOP" if self.control.estop_active else "E-STOP"
+            self.manual_button.desc = "AUTO" if self.control.state == "MANUAL" else "MANUAL"
             text = "RESUME" if self.control.paused else "PAUSE"
             if text != self.pause_button.desc:
                 self.pause_button.desc = text
             if not self.manual_enabled:
-                self.status_label.desc = "Paused" if self.control.paused else "STOP to jog"
-        text = "q1-6 (deg): " + " ".join(f"{value:+.1f}" for value in np.rad2deg(self.robot.q))
+                self.command = None
+                if self.control.state == "FAULT":
+                    self.status_label.desc = "Release E-stop, clear fault, then RESET"
+                elif self.control.state == "HOMING":
+                    self.status_label.desc = "Returning home slowly"
+                elif self.control.paused:
+                    self.status_label.desc = "Paused"
+                else:
+                    self.status_label.desc = "Select MANUAL from idle to jog"
+        robot_name = self.robot_names[self.robot_index]
+        text = f"{robot_name} joints (deg): " + " ".join(f"{value:+.1f}" for value in np.rad2deg(self.robot.q))
         if text != self.q_label.desc:
             self.q_label.desc = text
         xyz = self._pose(self.robot.q).t
-        text = "EE (m): " + "  ".join(f"{axis} {value:.3f}" for axis, value in zip("XYZ", xyz))
+        text = f"{robot_name} EE (m): " + "  ".join(f"{axis} {value:.3f}" for axis, value in zip("XYZ", xyz))
         if text != self.xyz_label.desc:
             self.xyz_label.desc = text
 
@@ -107,8 +131,20 @@ class TeachPendant:
 
     def stop_all(self, _=None):
         if self.control is not None:
-            self.control.stop()
+            self.control.toggle_estop()
         self.stop()
+
+    def reset(self, _=None):
+        self.command = None
+        if self.control is not None:
+            self.control.reset()
+        self.sync()
+
+    def toggle_manual(self, _=None):
+        self.command = None
+        if self.control is not None:
+            self.control.toggle_manual()
+        self.sync()
 
     def toggle_pause(self, _=None):
         if self.control is not None:
@@ -208,5 +244,7 @@ class TeachPendant:
                 or np.any(next_q > self.joint_limits[1])):
             self.command = None
             self.status_label.desc = "Joint limit"
+            if self.control is not None:
+                self.control.fault("Manual motion reached a joint limit")
             return
         self._set_joints(next_q)
