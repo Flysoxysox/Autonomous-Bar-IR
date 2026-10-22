@@ -1,16 +1,15 @@
 import numpy as np
-from scipy.optimize import least_squares, minimize_scalar
+from scipy.optimize import least_squares
 from scipy.spatial.transform import Rotation
 from roboticstoolbox import jtraj
 from spatialmath import SE3
 
-from pickup import MotionPlanningError
+from rs007l_controller import MotionPlanningError
 from scene import (
     HANDOVER_X, HANDOVER_Y, HANDOVER_HEIGHT,
     HANDOVER_SIZE_X, HANDOVER_SIZE_Y,
     FORK_MOUNT,
 )
-
 
 class TrayHandover:
     def __init__(self, controller, ur3, receiving_controller=None):
@@ -42,53 +41,11 @@ class TrayHandover:
         half = np.asarray(size, dtype=float) / 2
         return (name, centre - half, centre + half, False)
 
-    def _find_level_wrist(self, angles):
-        test_angles = np.zeros(6)
-
-        def tilt_error(wrist_angle):
-            test_angles[4] = wrist_angle
-            upward = self.tray_transform(test_angles)[:3, 2]
-            return np.sum((upward - [0, 0, 1]) ** 2)
-
-        bounds = (float(self.controller.lower[4]), float(self.controller.upper[4]))
-        result = minimize_scalar(tilt_error, bounds=bounds, method='bounded',
-                                 options={'xatol': 1e-10})
-        test_angles[4] = result.x
-        if tilt_error(result.x) > np.sin(np.deg2rad(0.3)) ** 2:
-            raise MotionPlanningError('Could not find a level near-zero holding pose')
-        return test_angles
-
     def _check_level(self, path, label):
         motion = self.controller
         for index, angles in enumerate(path):
             if self.tray_transform(angles)[2, 2] < np.cos(np.deg2rad(1.0)):
                 raise MotionPlanningError(f'{label} would tilt the tray at step {index}')
-
-    def _make_waypoint_path(self, angles, position, steps, label):
-        motion = self.controller
-        target = self.tray_transform(angles).copy()
-        target[:3, 3] = position
-        target_tool = self.tray_target_to_tool(target)
-        try:
-            path = motion._plan_cartesian_move(
-                angles, target_tool, steps, label, carrying=True
-            )
-            self._check_level(path, label)
-            return path
-        except MotionPlanningError as error:
-            original_error = error
-
-        for guess in (angles, np.asarray(motion.robot.q, dtype=float)):
-            try:
-                destination = motion._solve_inverse_kinematics(target_tool, guess, label)
-                count = max(steps, int(np.max(np.abs(destination - angles)) / np.deg2rad(1.5)) + 1)
-                path = jtraj(angles, destination, count).q
-                motion.check_trajectory(path, carrying=True, label=label)
-                self._check_level(path, label)
-                return path
-            except MotionPlanningError:
-                continue
-        raise MotionPlanningError(f'{label}: no safe Cartesian or joint-space route: {original_error}')
 
     def _orientation_preserving_path(self, start_angles, end_angles, obstacles, label, steps=150):
         motion = self.controller
@@ -241,7 +198,7 @@ class TrayHandover:
             motion.obstacles = motion._build_obstacles(
                 tray_position=final_pose[:3, 3]
             ) + extra_obstacles[1:]
-            # leave the forks in the placed tray while the ur3 serves
+            
             self.send_tray()
             return final_pose
         except Exception:

@@ -1,44 +1,48 @@
 from math import pi
 
 import numpy as np
-from scipy.optimize import least_squares, minimize_scalar
+import roboticstoolbox as rtb
+from scipy.optimize import least_squares
 from scipy.spatial.transform import Rotation
-from roboticstoolbox import jtraj
 from spatialmath import SE3
 
 from scene import (
     BAR_Y, BAR_HEIGHT, CONVEYOR_Y, CONVEYOR_HEIGHT,
-    CONVEYOR_LENGTH, CONVEYOR_WIDTH, CONVEYOR_CENTRE_X, CONVEYOR_TRAVEL_DISTANCE,
-    CONVEYOR_START_X, CONVEYOR_END_X,
-    BUTTON_X, BUTTON_Y, BUTTON_TOP, BUTTON_PRESS_DEPTH, BUTTON_RADIUS,
-    BUTTON_HOVER_HEIGHT, BLUE_BUTTON_X, BLUE_BUTTON_Y, BLUE_BUTTON_TOP,
-    DISHWASHER_FRONT_X, DISHWASHER_BACK_X, DISHWASHER_WIDTH, DISHWASHER_TOP,
-    DOOR_HEIGHT, DOOR_CLOSED_CENTRE, DOOR_RISE,
-    TRAY_WIDTH, TRAY_LENGTH, DECK_THICKNESS, RUNNER_HEIGHT,
+    CONVEYOR_TRAVEL_DISTANCE, CONVEYOR_END_X,
+    CONVEYOR_LENGTH, CONVEYOR_WIDTH, CONVEYOR_CENTRE_X, CONVEYOR_START_X,
+    BUTTON_X, BUTTON_Y, BUTTON_TOP, BUTTON_PRESS_DEPTH,
+    BUTTON_HOVER_HEIGHT,
+    BLUE_BUTTON_X, BLUE_BUTTON_Y, BLUE_BUTTON_TOP,
+    DISHWASHER_FRONT_X, DISHWASHER_BACK_X, DISHWASHER_WIDTH,
+    DISHWASHER_TOP, DOOR_CLOSED_CENTRE, DOOR_RISE,
+    TRAY_WIDTH, TRAY_LENGTH, RUNNER_HEIGHT, DECK_THICKNESS,
     RUNNER_WIDTH, RUNNER_X_POSITIONS, RIM_HEIGHT, RIM_THICKNESS,
     FORK_MOUNT, FORK_X_POSITIONS, FORK_WIDTH, FORK_LENGTH, FORK_THICKNESS,
-    HANDOVER_X, HANDOVER_Y, HANDOVER_HEIGHT,
-    HANDOVER_SIZE_X, HANDOVER_SIZE_Y, GLASS_ORIGIN_ABOVE_DECK,
+    DOOR_HEIGHT,
 )
 
-PICKUP_ANGLES_DEGREES = [0, 22, -79, 0, 10, 0]
 STEP_TIME = 0.005
-DISPLAY_EVERY = 12
-
+PICKUP_ANGLES_DEGREES = [0, 22, -79, 0, 10, 0]
 PICKUP_HEIGHT_CORRECTION = 0.012
 PICKUP_BACKOFF = 0.015
 APPROACH_DISTANCE = 0.370
 CONTACT_RISE = 0.006
-TRAY_LIFT = 0.055
+TRAY_LIFT = 0.3
+DISPLAY_EVERY = 1
 
 class MotionPlanningError(Exception):
     pass
 
+class MotionStopped(Exception):
+    pass
+
 class RS007LController:
-    def __init__(self, robot, scene, simulator, ur3=None, receiving_controller=None):
+
+    def __init__(self, robot, scene, simulator, dt=STEP_TIME):
         self.robot, self.scene, self.simulator = robot, scene, simulator
-        self.ur3 = ur3
-        self.receiving_controller = receiving_controller
+        self.stopped = False
+        self.on_step = None
+        self.pause_requested = None
         self.carrying_tray = False
         self.tray_placed = False
         self.conveyor_finished = False
@@ -48,9 +52,18 @@ class RS007LController:
         self.tray_offset_from_wrist = None
         self.pickup_paths = None
         self.button_hover_angles = {}
-        self.obstacles = self._build_obstacles()
         self.lower = np.asarray(robot.qlim[0], dtype=float).copy()
         self.upper = np.asarray(robot.qlim[1], dtype=float).copy()
+        self.obstacles = self._build_obstacles()
+        self.dt = float(dt)
+        self.state = "IDLE"
+        self.next_state = "IDLE"
+        self.elapsed = 0.0
+        self.trajectory = None
+        self.step = 0
+        self.wait_time = 0.0
+        self._sequence = None
+        self._carrying_segment = False
 
     def wrist_pose(self, joint_angles):
 
@@ -158,12 +171,16 @@ class RS007LController:
                     return False
         return True
 
+    def get_link_poses(self, joint_angles):
+        return [self.robot.world_pose.A @ frame
+                for frame in self.robot._joint_frames(joint_angles)]
+
     def check_collision(self, joint_angles, carrying=False, obstacles=None):
 
         joint_angles = np.asarray(joint_angles, dtype=float)
         if not np.isfinite(joint_angles).all() or np.any(joint_angles < self.lower) or np.any(joint_angles > self.upper):
             return 'joint limit or invalid joint value'
-        frames = [self.robot.world_pose.A @ transform for transform in self.robot._joint_frames(joint_angles)]
+        frames = self.get_link_poses(joint_angles)
         if obstacles is None:
             obstacles = self.obstacles
         obstacles = [o for o in obstacles if not carrying or not o[3]]
@@ -210,10 +227,26 @@ class RS007LController:
         return None
 
     def check_trajectory(self, trajectory, carrying=False, label='segment', obstacles=None):
+        previous = None
+        max_step = np.deg2rad(5)
         for index, joint_angles in enumerate(trajectory):
-            collision_message = self.check_collision(joint_angles, carrying=carrying, obstacles=obstacles)
-            if collision_message is not None:
-                raise MotionPlanningError(f'{label}: collision at step {index}: {collision_message}')
+            joint_angles = np.asarray(joint_angles, dtype=float)
+            samples = [joint_angles]
+            if (previous is not None and np.isfinite(previous).all()
+                    and np.isfinite(joint_angles).all()):
+                angle_change = np.max(np.abs(joint_angles - previous))
+                if angle_change > max_step:
+                    steps = int(np.ceil(angle_change / max_step)) + 1
+                    path = rtb.jtraj(previous, joint_angles, steps).q
+                    while np.any(np.abs(np.diff(path, axis=0)) > max_step):
+                        steps += 1
+                        path = rtb.jtraj(previous, joint_angles, steps).q
+                    samples = list(path[1:-1]) + samples
+            for q in samples:
+                collision_message = self.check_collision(q, carrying=carrying, obstacles=obstacles)
+                if collision_message is not None:
+                    raise MotionPlanningError(f'{label}: collision at step {index}: {collision_message}')
+            previous = joint_angles
 
     def _tool_pose_error(self, joint_angles, target):
         current_tool_pose = self.tool_pose(joint_angles)
@@ -248,175 +281,6 @@ class RS007LController:
         if np.linalg.norm(pose_error[:3]) > .002 or np.linalg.norm(pose_error[3:]) > np.deg2rad(1):
             raise MotionPlanningError(f'{label}: IK could not reach desired tool pose')
         return solution.x
-
-    def _plan_cartesian_move(self, starting_joint_angles, destination, step_count, label, carrying=False):
-
-        start = self.tool_pose(starting_joint_angles)
-
-        if np.linalg.norm(Rotation.from_matrix(
-                destination[:3,:3] @ start[:3,:3].T).as_rotvec()) > 1e-3:
-            raise MotionPlanningError(f'{label}: changing tool rotation not supported')
-        positions = np.linspace(start[:3, 3], destination[:3, 3], step_count)
-        joint_angles = starting_joint_angles.copy()
-        trajectory = [joint_angles.copy()]
-        for point in positions[1:]:
-            target = start.copy()
-            target[:3,3] = point
-
-            for _ in range(15):
-                pose_error = self._tool_pose_error(joint_angles, target)
-                if np.linalg.norm(pose_error[:3]) < .00045 and np.linalg.norm(pose_error[3:]) < .003:
-                    break
-                jacobian = self._calculate_jacobian(joint_angles)
-                damping = .006
-                joint_step = jacobian.T @ np.linalg.solve(jacobian @ jacobian.T + damping**2*np.eye(6), pose_error)
-                largest_joint_step = np.max(np.abs(joint_step))
-                if largest_joint_step > np.deg2rad(2):
-                    joint_step *= np.deg2rad(2) / largest_joint_step
-                joint_angles = joint_angles + joint_step
-                if np.any(joint_angles < self.lower) or np.any(joint_angles > self.upper):
-                    raise MotionPlanningError(f'{label}: joint limit encountered')
-            pose_error = self._tool_pose_error(joint_angles, target)
-            if np.linalg.norm(pose_error[:3]) > .002 or np.linalg.norm(pose_error[3:]) > np.deg2rad(1):
-                raise MotionPlanningError(f'{label}: RMRC lost the desired tool pose')
-            collision_message = self.check_collision(joint_angles, carrying=carrying)
-            if collision_message:
-                raise MotionPlanningError(f'{label}: collision: {collision_message}')
-            trajectory.append(joint_angles.copy())
-        return np.asarray(trajectory)
-
-    def _animate_path(self, joint_path, carrying=False):
-        if len(joint_path) == 0:
-            return
-        frame_indices = list(range(0, len(joint_path), DISPLAY_EVERY))
-        if frame_indices[-1] != len(joint_path) - 1:
-            frame_indices.append(len(joint_path) - 1)
-        for index in frame_indices:
-            joint_angles = joint_path[index]
-            self.robot.set_joint_angles(joint_angles)
-            self.scene.update_fork()
-            if carrying:
-                self.scene.set_tray_pose(SE3(self.wrist_pose(joint_angles) @ self.tray_offset_from_wrist))
-            self.simulator.step(STEP_TIME)
-
-    def pickup(self):
-        if self.tray_placed:
-            print('The tray has already been placed on the conveyor. Restart to reset the scene.')
-            return
-        if self.carrying_tray:
-            print('The tray is already being carried.')
-            return
-
-        print('Planning collision-checked approach and RMRC insertion...')
-        pickup_joint_angles = np.deg2rad(PICKUP_ANGLES_DEGREES)
-        target = self.tool_pose(pickup_joint_angles)
-        target[:3,3] += [0, -PICKUP_BACKOFF + (BAR_Y - 1.02), PICKUP_HEIGHT_CORRECTION]
-        insertion_joint_angles = self._solve_inverse_kinematics(target, pickup_joint_angles, 'aligned insertion pose')
-
-        staging = target.copy()
-        staging[1,3] -= APPROACH_DISTANCE
-        staging_joint_angles = self._solve_inverse_kinematics(staging, insertion_joint_angles, 'approach pose')
-
-        current_joint_angles = np.asarray(self.robot.q, dtype=float).copy()
-        approach_path = jtraj(current_joint_angles, staging_joint_angles, 120).q
-        self.check_trajectory(approach_path, label='staged approach')
-
-        insertion_path = self._plan_cartesian_move(staging_joint_angles, target, 85, 'horizontal fork insertion')
-
-        contact_pose = self.tool_pose(insertion_path[-1])
-        contact_pose[2,3] += CONTACT_RISE
-        contact_path = self._plan_cartesian_move(insertion_path[-1], contact_pose, 14,
-                                  'raise prongs to tray underside')
-
-        lifting_pose = self.tool_pose(contact_path[-1])
-        lifting_pose[2,3] += TRAY_LIFT
-        lift_path = self._plan_cartesian_move(contact_path[-1], lifting_pose, 45,
-                               'lift loaded tray', carrying=True)
-
-        print('Plan accepted: approach -> horizontal insertion -> contact -> lift.')
-        self._animate_path(approach_path)
-        self._animate_path(insertion_path)
-        self._animate_path(contact_path)
-
-        self.tray_offset_from_wrist = np.linalg.inv(self.wrist_pose(self.robot.q)) @ self.scene.tray_pose.A
-        self.carrying_tray = True
-        self._animate_path(lift_path, carrying=True)
-        self.pickup_paths = {'insertion': insertion_path.copy(),
-                                'contact': contact_path.copy(),
-                                'lift': lift_path.copy()}
-        print('Tray picked up and lifted approximately 55 mm. Holding position.')
-        print('Final joints:', np.round(np.rad2deg(self.robot.q), 1))
-
-    def place(self):
-
-        if not self.carrying_tray or self.pickup_paths is None:
-            print('No tray held. Type "pick" first.')
-            return
-        if not np.isclose(CONVEYOR_HEIGHT, BAR_HEIGHT, atol=1e-6):
-            raise MotionPlanningError('Placement assumes matching bar and conveyor heights.')
-        if abs(-BAR_Y - CONVEYOR_Y) + TRAY_LENGTH/2 >= (CONVEYOR_WIDTH - 0.07)/2:
-            raise MotionPlanningError('Mirrored tray position would overhang the conveyor belt.')
-
-        lifted_joint_angles = np.asarray(self.robot.q, dtype=float).copy()
-
-        turn_angle = (-pi + 1e-5) if lifted_joint_angles[0] > -0.01 else (pi - 1e-5)
-        rear_joint_angles = lifted_joint_angles.copy()
-        rear_joint_angles[0] += turn_angle
-        if rear_joint_angles[0] < self.lower[0] or rear_joint_angles[0] > self.upper[0]:
-            raise MotionPlanningError('JT1 cannot complete a 180 degree turn.')
-
-        def mirror(path):
-            mirrored = np.asarray(path, dtype=float).copy()
-            mirrored[:, 0] += turn_angle
-            return mirrored
-
-        print('Planning collision-checked half-turn, lowering and withdrawal...')
-
-        rotation_path = jtraj(lifted_joint_angles, rear_joint_angles, 160).q
-        lowering_path = mirror(self.pickup_paths['lift'][::-1])
-        disengage_path = mirror(self.pickup_paths['contact'][::-1])
-        withdrawal_path = mirror(self.pickup_paths['insertion'][::-1])
-
-        self.check_trajectory(rotation_path, carrying=True, label='180-degree swivel')
-        self.check_trajectory(lowering_path, carrying=True, label='level lowering')
-
-        final_tray_pose = self.wrist_pose(lowering_path[-1]) @ self.tray_offset_from_wrist
-        target_position = np.array([0.0, -BAR_Y, CONVEYOR_HEIGHT])
-        if np.linalg.norm(final_tray_pose[:3, 3] - target_position) > .008:
-            raise MotionPlanningError(
-                f'Predicted tray position {np.round(final_tray_pose[:3,3], 3)} '
-                f'is not centred over the conveyor loading position at {target_position}.')
-        for label, trajectory in [('swivel', rotation_path), ('lowering', lowering_path)]:
-            for joint_angles in trajectory:
-                transform = self.wrist_pose(joint_angles) @ self.tray_offset_from_wrist
-                if np.dot(transform[:3, 2], [0, 0, 1]) < np.cos(np.deg2rad(1)):
-                    raise MotionPlanningError(f'{label}: tray would tilt')
-
-        placed_obstacles = self._build_obstacles(tray_position=target_position)
-        self.check_trajectory(disengage_path, label='fork disengagement',
-                              obstacles=placed_obstacles)
-        self.check_trajectory(withdrawal_path, label='fork withdrawal',
-                              obstacles=placed_obstacles)
-
-        print('Placement accepted: swivel -> lower -> release -> withdraw.')
-        self._animate_path(rotation_path, carrying=True)
-        self._animate_path(lowering_path, carrying=True)
-
-        self.scene.set_tray_pose(SE3(final_tray_pose))
-        self.carrying_tray = False
-        self.tray_offset_from_wrist = None
-        self.obstacles = placed_obstacles
-        self._animate_path(disengage_path)
-        self._animate_path(withdrawal_path)
-        self.rear_pickup_paths = {
-            "insertion": withdrawal_path[::-1].copy(),
-            "contact": disengage_path[::-1].copy(),
-            "lift": lowering_path[::-1].copy(),
-        }
-        self.pickup_paths = None
-        self.tray_placed = True
-        print('Tray placed on the conveyor. Forks withdrawn.')
-        print('Final joints:', np.round(np.rad2deg(self.robot.q), 1))
 
     def _fork_tip_position(self, joint_angles, prong=0):
 
@@ -459,7 +323,7 @@ class RS007LController:
                 continue
             if self.check_collision(q):
                 continue
-            path = jtraj(home, q, 105).q
+            path = rtb.jtraj(home, q, 105).q
             try:
                 self.check_trajectory(path, label=f'home to {name} button')
             except MotionPlanningError:
@@ -484,15 +348,15 @@ class RS007LController:
         if np.allclose(current, hover_angles, atol=1e-6):
             approach = []
         else:
-            direct_path = jtraj(current, hover_angles, 95).q
+            direct_path = rtb.jtraj(current, hover_angles, 95).q
             try:
                 self.check_trajectory(direct_path, label=f'approach {name} button')
                 approach = [direct_path]
             except MotionPlanningError:
-                to_home = jtraj(current, np.zeros(6), 110).q
+                to_home = rtb.jtraj(current, np.zeros(6), 110).q
                 self.check_trajectory(to_home, label=f'safe approach to {name} button')
                 if home_approach is None:
-                    home_approach = jtraj(np.zeros(6), hover_angles, 105).q
+                    home_approach = rtb.jtraj(np.zeros(6), hover_angles, 105).q
                 self.check_trajectory(home_approach, label=f'home to {name} button')
                 approach = [to_home, home_approach]
 
@@ -506,413 +370,455 @@ class RS007LController:
         self.check_trajectory(release, label=f'release {name} button')
         return approach, press, release
 
-    def _move_to_button(self, name):
+    def wait_if_paused(self):
+        
+        while self.pause_requested is not None and self.pause_requested():
+            if self.stopped:
+                raise MotionStopped()
+            if self.on_step is not None:
+                self.on_step()
+            self.simulator.step(STEP_TIME)
+        if self.stopped:
+            raise MotionStopped()
+
+    def step_simulation(self, dt=STEP_TIME):
+        
+        self.wait_if_paused()
+        if self.on_step is not None:
+            self.on_step()
+        self.simulator.step(dt)
+        self.wait_if_paused()
+
+    def _animate_path(self, joint_path, carrying=False):
+        if len(joint_path) == 0:
+            return
+        frame_indices = list(range(0, len(joint_path), DISPLAY_EVERY))
+        if frame_indices[-1] != len(joint_path) - 1:
+            frame_indices.append(len(joint_path) - 1)
+        for index in frame_indices:
+            self.wait_if_paused()
+            joint_angles = joint_path[index]
+            self.robot.set_joint_angles(joint_angles)
+            self.scene.update_fork()
+            if carrying:
+                self.scene.set_tray_pose(SE3(self.wrist_pose(joint_angles) @ self.tray_offset_from_wrist))
+            self.step_simulation()
+
+    def plan_rmrc(self, target_pose, steps=100, q_start=None,
+                  carrying=False, label="RMRC", obstacles=None):
+        if steps < 2:
+            raise ValueError("RMRC needs at least two trajectory samples")
+        q_start = np.asarray(
+            self.robot.q if q_start is None else q_start, dtype=float
+        ).reshape(self.robot.n).copy()
+        start_pose = SE3(self.tool_pose(q_start))
+        poses = rtb.ctraj(start_pose, SE3(target_pose), steps)
+        q_matrix = np.empty((steps, self.robot.n))
+        q_matrix[0] = q_start
+
+        for i in range(steps - 1):
+            q = q_matrix[i].copy()
+            target = poses[i + 1].A
+
+            for _ in range(15):
+                error = self._tool_pose_error(q, target)
+                if (np.linalg.norm(error[:3]) < 0.00045
+                        and np.linalg.norm(error[3:]) < 0.003):
+                    break
+
+                xdot = error / self.dt
+                J = self._calculate_jacobian(q)
+                damping = 0.006
+                qdot = np.linalg.solve(
+                    J.T @ J + damping**2 * np.eye(self.robot.n),
+                    J.T @ xdot,
+                )
+                dq = self.dt * qdot
+                max_step = np.max(np.abs(dq))
+                if max_step > np.deg2rad(2):
+                    dq *= np.deg2rad(2) / max_step
+                q += dq
+                if (not np.isfinite(q).all()
+                        or np.any(q < self.lower)
+                        or np.any(q > self.upper)):
+                    raise MotionPlanningError(f"{label}: joint limit at step {i + 1}")
+
+            error = self._tool_pose_error(q, target)
+            if (np.linalg.norm(error[:3]) > 0.002
+                    or np.linalg.norm(error[3:]) > np.deg2rad(1)):
+                raise MotionPlanningError(f"{label}: RMRC tracking error at step {i + 1}")
+            collision = self.check_collision(
+                q, carrying=carrying, obstacles=obstacles,
+            )
+            if collision is not None:
+                raise MotionPlanningError(f"{label}: collision at step {i + 1}: {collision}")
+            q_matrix[i + 1] = q
+
+        return q_matrix
+
+    def _plan_cartesian_move(self, starting_joint_angles, destination, step_count,
+                             label, carrying=False):
+
+        return self.plan_rmrc(
+            SE3(destination), steps=step_count, q_start=starting_joint_angles,
+            carrying=carrying, label=label,
+        )
+
+    def change_state(self, new_state):
+
+        if self.stopped:
+            return
+        if self._sequence is not None:
+            raise RuntimeError(f"Kawasaki is already executing {self.state}")
+
+        actions = {
+            "PICKUP": self._pickup_sequence,
+            "PLACE": self._place_sequence,
+            "OPEN_DOOR": lambda: self._toggle_door_sequence(True),
+            "CLOSE_DOOR": lambda: self._toggle_door_sequence(False),
+            "CONVEY_IN": lambda: self._conveyor_sequence(True),
+            "CONVEY_OUT": lambda: self._conveyor_sequence(False),
+            "WASH": self._wash_sequence,
+            "COLLECT_CLEAN_TRAY": self._collect_clean_tray_sequence,
+            "DISHWASHER_CYCLE": self._dishwasher_sequence,
+        }
+        if new_state not in actions:
+            raise ValueError(f"Unknown Kawasaki action: {new_state}")
+        self._sequence = actions[new_state]()
+        self.next_state = new_state
+        self._advance_state()
+
+    def _advance_state(self):
+
+        if self._sequence is None or self.stopped:
+            return
+        try:
+            name, path, carrying, wait_time = next(self._sequence)
+        except StopIteration:
+            self._sequence = None
+            self.state = self.next_state = "IDLE"
+            self.trajectory = None
+            self.wait_time = 0.0
+            self.elapsed = 0.0
+            return
+        except Exception:
+            self.state = "ERROR"
+            self._sequence = None
+            self.trajectory = None
+            raise
+
+        self.state = name
+        self.step = 0
+        self.elapsed = 0.0
+        self.wait_time = float(wait_time)
+        self.trajectory = None if path is None else np.asarray(path, dtype=float)
+        self._carrying_segment = bool(carrying)
+
+    @staticmethod
+    def _segment(name, path=None, carrying=False, wait_time=0.0):
+        return name, path, carrying, wait_time
+
+    def update(self, dt, world=None):
+
+        if self.stopped or self.state in ("IDLE", "ERROR", "STOPPED"):
+            return
+        if self.pause_requested is not None and self.pause_requested():
+            return
+        if dt <= 0:
+            return
+
+        self.elapsed += float(dt)
+        if self.trajectory is None:
+            if self.elapsed + 1e-12 >= self.wait_time:
+                self._advance_state()
+            return
+
+        if self.elapsed + 1e-12 >= self.dt:
+            self.elapsed -= self.dt
+            if self.step < len(self.trajectory):
+                q = self.trajectory[self.step]
+                self.robot.set_joint_angles(q)
+                self.scene.update_fork()
+                if self._carrying_segment:
+                    if self.tray_offset_from_wrist is None:
+                        raise MotionPlanningError("Tray attachment missing during motion")
+                    tr_world_tray = self.wrist_pose(q) @ self.tray_offset_from_wrist
+                    self.scene.set_tray_pose(SE3(tr_world_tray))
+                self.step += 1
+            else:
+                self._advance_state()
+
+    def stop(self):
+
+        self.stopped = True
+        self.state = self.next_state = "STOPPED"
+        self._sequence = None
+        self.trajectory = None
+        self.step = 0
+        self.robot.qd = np.zeros(self.robot.n)
+        self.robot.qdd = np.zeros(self.robot.n)
+
+    def _pickup_sequence(self):
+        if self.tray_placed or self.carrying_tray:
+            raise MotionPlanningError("Tray is already placed or being carried")
+
+        seed = np.deg2rad(PICKUP_ANGLES_DEGREES)
+        target = self.tool_pose(seed)
+        target[:3, 3] += [0, -PICKUP_BACKOFF + (BAR_Y - 1.02), PICKUP_HEIGHT_CORRECTION]
+        insertion_q = self._solve_inverse_kinematics(target, seed, "aligned insertion pose")
+        staging = target.copy()
+        staging[1, 3] -= APPROACH_DISTANCE
+        staging_q = self._solve_inverse_kinematics(staging, insertion_q, "approach pose")
+
+        approach = rtb.jtraj(self.robot.q, staging_q, 120).q
+        self.check_trajectory(approach, label="staged approach")
+        insertion = self.plan_rmrc(target, 85, q_start=staging_q,
+                                   label="horizontal fork insertion")
+        contact_target = self.tool_pose(insertion[-1])
+        contact_target[2, 3] += CONTACT_RISE
+        contact = self.plan_rmrc(contact_target, 14, q_start=insertion[-1],
+                                 label="raise forks")
+        lift_target = self.tool_pose(contact[-1])
+        lift_target[2, 3] += TRAY_LIFT
+
+        future_offset = np.linalg.inv(self.wrist_pose(contact[-1])) @ self.scene.tray_pose.A
+        original_offset = self.tray_offset_from_wrist
+        self.tray_offset_from_wrist = future_offset
+        try:
+            lift = self.plan_rmrc(lift_target, 45, q_start=contact[-1],
+                                  carrying=True, label="lift loaded tray")
+        finally:
+            self.tray_offset_from_wrist = original_offset
+
+        self.pickup_paths = {
+            "insertion": insertion.copy(),
+            "contact": contact.copy(),
+            "lift": lift.copy(),
+        }
+        yield self._segment("APPROACH_TRAY", approach)
+        yield self._segment("INSERT_FORKS", insertion)
+        yield self._segment("CONTACT_TRAY", contact)
+
+        self.tray_offset_from_wrist = np.linalg.inv(self.wrist_pose(self.robot.q)) @ self.scene.tray_pose.A
+        self.carrying_tray = True
+        yield self._segment("LIFT_TRAY", lift, carrying=True)
+
+    def _place_sequence(self):
+        if not self.carrying_tray or self.pickup_paths is None:
+            raise MotionPlanningError("No picked-up tray available for placement")
+        if not np.isclose(CONVEYOR_HEIGHT, BAR_HEIGHT, atol=1e-6):
+            raise MotionPlanningError("Placement requires matching bar and conveyor heights")
+        if abs(-BAR_Y - CONVEYOR_Y) + TRAY_LENGTH / 2 >= (0.72 - 0.07) / 2:
+            raise MotionPlanningError("Mirrored tray position overhangs conveyor")
+
+        start = np.asarray(self.robot.q, dtype=float).copy()
+        turn = (-pi + 1e-5) if start[0] > -0.01 else (pi - 1e-5)
+        finish = start.copy()
+        finish[0] += turn
+        if not self.lower[0] <= finish[0] <= self.upper[0]:
+            raise MotionPlanningError("JT1 cannot complete its 180 degree turn")
+
+        def mirror(path):
+            mirrored = np.asarray(path, dtype=float).copy()
+            mirrored[:, 0] += turn
+            return mirrored
+
+        rotation = rtb.jtraj(start, finish, 160).q
+        lowering = mirror(self.pickup_paths["lift"][::-1])
+        disengage = mirror(self.pickup_paths["contact"][::-1])
+        withdrawal = mirror(self.pickup_paths["insertion"][::-1])
+
+        self.check_trajectory(rotation, carrying=True, label="180 degree swivel")
+        self.check_trajectory(lowering, carrying=True, label="lowering")
+        tr_final = self.wrist_pose(lowering[-1]) @ self.tray_offset_from_wrist
+        target = np.array([0.0, -BAR_Y, CONVEYOR_HEIGHT])
+        if np.linalg.norm(tr_final[:3, 3] - target) > 0.008:
+            raise MotionPlanningError("Predicted tray pose does not reach conveyor")
+        for path in (rotation, lowering):
+            for q in path:
+                tray_frame = self.wrist_pose(q) @ self.tray_offset_from_wrist
+                if tray_frame[2, 2] < np.cos(np.deg2rad(1)):
+                    raise MotionPlanningError("Placement would tilt tray")
+        placed_obstacles = self._build_obstacles(tray_position=target)
+        self.check_trajectory(disengage, label="fork disengagement",
+                              obstacles=placed_obstacles)
+        self.check_trajectory(withdrawal, label="fork withdrawal",
+                              obstacles=placed_obstacles)
+
+        yield self._segment("SWIVEL_TO_CONVEYOR", rotation, carrying=True)
+        yield self._segment("LOWER_TRAY", lowering, carrying=True)
+        self.scene.set_tray_pose(SE3(tr_final))
+        self.carrying_tray = False
+        self.tray_offset_from_wrist = None
+        self.obstacles = placed_obstacles
+        yield self._segment("DISENGAGE_FORKS", disengage)
+        yield self._segment("WITHDRAW_FORKS", withdrawal)
+
+        self.rear_pickup_paths = {
+            "insertion": withdrawal[::-1].copy(),
+            "contact": disengage[::-1].copy(),
+            "lift": lowering[::-1].copy(),
+        }
+        self.pickup_paths = None
+        self.tray_placed = True
+
+    def _button_press_sequence(self, name):
         self.obstacles = self._build_obstacles()
         approach, press, release = self._plan_button_paths(name)
-        for path in approach:
-            self._animate_path(path)
-        self._animate_path(press)
-        if name == 'blue':
+        for index, path in enumerate(approach):
+            yield self._segment(f"APPROACH_{name.upper()}_BUTTON_{index + 1}", path)
+        yield self._segment(f"PRESS_{name.upper()}_BUTTON", press)
+        if name == "blue":
             self.scene.set_blue_button_pressed(True)
         else:
             self.scene.set_button_pressed(True)
-        self.simulator.step(STEP_TIME)
         return release
 
-    def _release_button(self, name, release):
-        self._animate_path(release)
-        if name == 'blue':
+    def _button_release_sequence(self, name, release):
+        yield self._segment(f"RELEASE_{name.upper()}_BUTTON", release)
+        if name == "blue":
             self.scene.set_blue_button_pressed(False)
         else:
             self.scene.set_button_pressed(False)
-        self.simulator.step(STEP_TIME)
         self.obstacles = self._build_obstacles()
 
-    def toggle_door(self, open_door):
+    def _toggle_door_sequence(self, open_door):
         if self.carrying_tray:
-            raise MotionPlanningError('Cannot operate the dishwasher while carrying the tray')
+            raise MotionPlanningError("Cannot move dishwasher door while carrying tray")
         if self.scene.door_open == open_door:
             return
-        print('Opening dishwasher door...' if open_door else 'Closing dishwasher door...')
-        release = self._move_to_button('blue')
-        self.scene.set_door_open(open_door, step_time=STEP_TIME)
-        self._release_button('blue', release)
-        self.obstacles = self._build_obstacles()
+        release = yield from self._button_press_sequence("blue")
+        start = float(self.scene.door_fraction)
+        target = 1.0 if open_door else 0.0
+        for fraction in np.linspace(start, target, 16):
+            self.scene.door_fraction = float(fraction)
+            self.scene.door.T = SE3(
+                DISHWASHER_FRONT_X, -BAR_Y,
+                DOOR_CLOSED_CENTRE + DOOR_RISE * fraction,
+            ).A
+            yield self._segment("OPEN_DOOR" if open_door else "CLOSE_DOOR")
+        self.scene.door_open = bool(open_door)
+        yield from self._button_release_sequence("blue", release)
 
-    def _move_conveyor(self, forward):
-        if not self.tray_placed or self.carrying_tray:
-            raise MotionPlanningError('Tray must be on the conveyor')
-        if not self.scene.door_open:
-            raise MotionPlanningError('Open dishwasher door before moving the conveyor')
+    def _conveyor_sequence(self, forward):
+        if not self.tray_placed or self.carrying_tray or not self.scene.door_open:
+            raise MotionPlanningError("Tray must be on conveyor and dishwasher door open")
         start = self.scene.tray_pose.A.copy()
         target_x = CONVEYOR_TRAVEL_DISTANCE if forward else 0.0
         if not forward and not self.washed:
-            raise MotionPlanningError('Dishwasher cycle has not finished')
-        if forward and start[0, 3] > .01:
-            raise MotionPlanningError('Tray is already in the dishwasher')
-        if not forward and abs(start[0, 3] - CONVEYOR_TRAVEL_DISTANCE) > .01:
-            raise MotionPlanningError('Tray is not in the dishwasher')
-        if target_x + TRAY_WIDTH/2 > CONVEYOR_END_X-.02:
-            raise MotionPlanningError('Tray would overrun conveyor')
-        if forward and target_x - TRAY_WIDTH/2 <= DISHWASHER_FRONT_X + .04:
-            raise MotionPlanningError('Tray would not fully enter dishwasher')
-        if abs(self.scene.tray_pose.t[1] - CONVEYOR_Y) + TRAY_LENGTH/2 >= DISHWASHER_WIDTH/2 - .035:
-            raise MotionPlanningError('Tray would hit dishwasher side walls')
-        if CONVEYOR_HEIGHT + RUNNER_HEIGHT + DECK_THICKNESS + .17 >= DISHWASHER_TOP:
-            raise MotionPlanningError('Glasses would hit dishwasher roof')
-        if target_x + TRAY_WIDTH/2 >= DISHWASHER_BACK_X - .03:
-            raise MotionPlanningError('Tray would hit dishwasher back wall')
-        self.obstacles = self._build_obstacles()
-        release = self._move_to_button('green')
-        print('Green button held. Moving tray into dishwasher...' if forward else
-              'Green button held. Returning tray along conveyor...')
+            raise MotionPlanningError("Tray cannot return before wash")
+        if forward and start[0, 3] > 0.01:
+            raise MotionPlanningError("Tray already inside dishwasher")
+        if not forward and abs(start[0, 3] - CONVEYOR_TRAVEL_DISTANCE) > 0.01:
+            raise MotionPlanningError("Tray not inside dishwasher")
+        if target_x + TRAY_WIDTH / 2 > CONVEYOR_END_X - 0.02:
+            raise MotionPlanningError("Tray would overrun conveyor")
+        if forward and target_x - TRAY_WIDTH / 2 <= DISHWASHER_FRONT_X + 0.04:
+            raise MotionPlanningError("Tray would not fully enter dishwasher")
+        if abs(self.scene.tray_pose.t[1] - CONVEYOR_Y) + TRAY_LENGTH / 2 >= DISHWASHER_WIDTH / 2 - 0.035:
+            raise MotionPlanningError("Tray would hit dishwasher walls")
+        if CONVEYOR_HEIGHT + RUNNER_HEIGHT + DECK_THICKNESS + 0.17 >= DISHWASHER_TOP:
+            raise MotionPlanningError("Glasses would hit dishwasher roof")
+        if target_x + TRAY_WIDTH / 2 >= DISHWASHER_BACK_X - 0.03:
+            raise MotionPlanningError("Tray would hit dishwasher back")
+
+        release = yield from self._button_press_sequence("green")
         for progress in np.linspace(0, 1, 30):
-            smooth = progress**2*(3-2*progress)
+            smooth = progress**2 * (3 - 2 * progress)
             pose = start.copy()
-            pose[0,3] = start[0,3]*(1-smooth) + target_x*smooth
+            pose[0, 3] = start[0, 3] * (1 - smooth) + target_x * smooth
             self.scene.set_tray_pose(SE3(pose))
-            self.simulator.step(STEP_TIME)
+            yield self._segment("CONVEY_IN" if forward else "CONVEY_OUT")
         self.obstacles = self._build_obstacles()
-        self._release_button('green', release)
+        yield from self._button_release_sequence("green", release)
         self.conveyor_finished = forward
-        print('Conveyor stopped. Green button released.')
 
-    def wash(self):
-        import time
-        if not self.scene.door_open or abs(self.scene.tray_pose.t[0] - CONVEYOR_TRAVEL_DISTANCE) > .01:
-            raise MotionPlanningError('Tray must be inside dishwasher with door open before washing')
-        self.toggle_door(False)
-        print('Dishwasher closed. Washing for 2 seconds...')
-        time.sleep(2)
+    def _wash_sequence(self):
+        if not self.scene.door_open or abs(self.scene.tray_pose.t[0] - CONVEYOR_TRAVEL_DISTANCE) > 0.01:
+            raise MotionPlanningError("Open door and position tray inside before washing")
+        yield from self._toggle_door_sequence(False)
+        yield self._segment("WASHING", wait_time=2.0)
         self.washed = True
-        self.toggle_door(True)
-        print('Dishwasher open. Ready to return tray.')
+        yield from self._toggle_door_sequence(True)
 
-    def collect_clean_tray(self):
-        if not self.washed or self.scene.door_open is False:
-            raise MotionPlanningError('Dishwasher must finish and door must be open')
-        if np.linalg.norm(self.scene.tray_pose.t - [0, -BAR_Y, CONVEYOR_HEIGHT]) > .008:
-            raise MotionPlanningError('Tray is not at the loading position')
+    def _collect_clean_tray_sequence(self):
+        if not self.washed or not self.scene.door_open:
+            raise MotionPlanningError("Dishwasher must finish and door be open")
+        if np.linalg.norm(self.scene.tray_pose.t - [0, -BAR_Y, CONVEYOR_HEIGHT]) > 0.008:
+            raise MotionPlanningError("Tray not in the loading position")
         if self.rear_pickup_paths is None:
-            raise MotionPlanningError('Missing return pickup trajectory')
-        insert = self.rear_pickup_paths['insertion']
-        contact = self.rear_pickup_paths['contact']
-        lift = self.rear_pickup_paths['lift']
-        current_angles = np.asarray(self.robot.q, dtype=float).copy()
-        start = jtraj(current_angles, insert[0], 115).q
+            raise MotionPlanningError("Missing return pickup trajectory")
+        insert = self.rear_pickup_paths["insertion"]
+        contact = self.rear_pickup_paths["contact"]
+        lift = self.rear_pickup_paths["lift"]
+        current = np.asarray(self.robot.q, dtype=float).copy()
+        arrival = rtb.jtraj(current, insert[0], 115).q
         self.obstacles = self._build_obstacles()
         try:
-            self.check_trajectory(start, label='approach clean tray')
-            arrival_paths = [start]
+            self.check_trajectory(arrival, label="approach clean tray")
+            arrival_paths = [arrival]
         except MotionPlanningError:
-            to_home = jtraj(current_angles, np.zeros(6), 110).q
-            from_home = jtraj(np.zeros(6), insert[0], 115).q
-            self.check_trajectory(to_home, label='leave button area before collecting tray')
-            self.check_trajectory(from_home, label='approach clean tray from home')
+            to_home = rtb.jtraj(current, np.zeros(6), 110).q
+            from_home = rtb.jtraj(np.zeros(6), insert[0], 115).q
+            self.check_trajectory(to_home, label="leave button area")
+            self.check_trajectory(from_home, label="approach clean tray from home")
             arrival_paths = [to_home, from_home]
-        self.check_trajectory(insert, label='insert forks under clean tray')
-        self.check_trajectory(contact, label='raise forks under clean tray')
-        self.check_trajectory(lift, carrying=True, label='lift clean tray')
-        for path in arrival_paths:
-            self._animate_path(path)
-        self._animate_path(insert)
-        self._animate_path(contact)
+        self.check_trajectory(insert, label="insert forks under clean tray")
+        self.check_trajectory(contact, label="contact clean tray")
+
+        future_offset = np.linalg.inv(self.wrist_pose(contact[-1])) @ self.scene.tray_pose.A
+        original_offset = self.tray_offset_from_wrist
+        self.tray_offset_from_wrist = future_offset
+        try:
+            self.check_trajectory(lift, carrying=True, label="lift clean tray")
+        finally:
+            self.tray_offset_from_wrist = original_offset
+
+        for index, path in enumerate(arrival_paths):
+            yield self._segment(f"RETURN_TO_TRAY_{index + 1}", path)
+        yield self._segment("INSERT_CLEAN_TRAY", insert)
+        yield self._segment("CONTACT_CLEAN_TRAY", contact)
         self.tray_offset_from_wrist = np.linalg.inv(self.wrist_pose(self.robot.q)) @ self.scene.tray_pose.A
         self.carrying_tray = True
-        self._animate_path(lift, carrying=True)
+        yield self._segment("LIFT_CLEAN_TRAY", lift, carrying=True)
         self.tray_placed = False
         self.wash_complete = True
         self.rear_pickup_paths = None
-        print('Clean tray lifted off conveyor. Kawasaki holding tray.')
 
-    def dishwasher_cycle(self):
+    def _dishwasher_sequence(self):
         if not self.tray_placed and not self.carrying_tray:
-            self.pickup()
+            yield from self._pickup_sequence()
         if self.carrying_tray and not self.wash_complete:
-            self.place()
+            yield from self._place_sequence()
         if not self.scene.door_open:
-            self.toggle_door(True)
+            yield from self._toggle_door_sequence(True)
         if not self.conveyor_finished:
-            self._move_conveyor(True)
+            yield from self._conveyor_sequence(True)
         if not self.washed:
-            self.wash()
+            yield from self._wash_sequence()
         if self.conveyor_finished:
-            self._move_conveyor(False)
+            yield from self._conveyor_sequence(False)
         if not self.carrying_tray:
-            self.collect_clean_tray()
+            yield from self._collect_clean_tray_sequence()
+
+    def pickup(self):
+        self.change_state("PICKUP")
+
+    def place(self):
+        self.change_state("PLACE")
+
+    def toggle_door(self, open_door):
+        self.change_state("OPEN_DOOR" if open_door else "CLOSE_DOOR")
+
+    def wash(self):
+        self.change_state("WASH")
+
+    def collect_clean_tray(self):
+        self.change_state("COLLECT_CLEAN_TRAY")
 
     def button_and_convey(self):
-        self._move_conveyor(True)
+        self.change_state("CONVEY_IN")
 
-    # HANDOVER OPERATIONS
+    def dishwasher_cycle(self):
 
-    def send_tray(self):
-        if self.receiving_controller is None:
-            return
-        height = RUNNER_HEIGHT + DECK_THICKNESS + GLASS_ORIGIN_ABOVE_DECK
-        glass_positions = np.array([
-            [x, y, height]
-            for x in (-0.118, 0.0, 0.118)
-            for y in (-0.118, 0.0, 0.118)
-        ], dtype=float)
-        tray_pose = SE3(self.scene.tray_pose.A.copy())
-        self.receiving_controller.recieve_tray(tray_pose, glass_positions)
-
-    def tray_transform(self, angles):
-        motion = self
-        return motion.wrist_pose(angles) @ motion.tray_offset_from_wrist
-
-    def tray_target_to_tool(self, tray_transform):
-        motion = self
-        wrist = tray_transform @ np.linalg.inv(motion.tray_offset_from_wrist)
-        return wrist @ FORK_MOUNT.A @ SE3(0, 0.24, -0.025).A
-
-    def add_obstacle(self, name, centre, size):
-        centre = np.asarray(centre, dtype=float)
-        half = np.asarray(size, dtype=float) / 2
-        return (name, centre - half, centre + half, False)
-
-    def _find_level_wrist(self, angles):
-        test_angles = np.zeros(6)
-
-        def tilt_error(wrist_angle):
-            test_angles[4] = wrist_angle
-            upward = self.tray_transform(test_angles)[:3, 2]
-            return np.sum((upward - [0, 0, 1]) ** 2)
-
-        bounds = (float(self.lower[4]), float(self.upper[4]))
-        result = minimize_scalar(tilt_error, bounds=bounds, method='bounded',
-                                 options={'xatol': 1e-10})
-        test_angles[4] = result.x
-        if tilt_error(result.x) > np.sin(np.deg2rad(0.3)) ** 2:
-            raise MotionPlanningError('Could not find a level near-zero holding pose')
-        return test_angles
-
-    def _check_level(self, path, label):
-        motion = self
-        for index, angles in enumerate(path):
-            if self.tray_transform(angles)[2, 2] < np.cos(np.deg2rad(1.0)):
-                raise MotionPlanningError(f'{label} would tilt the tray at step {index}')
-
-    def _make_waypoint_path(self, angles, position, steps, label):
-        motion = self
-        target = self.tray_transform(angles).copy()
-        target[:3, 3] = position
-        target_tool = self.tray_target_to_tool(target)
-        try:
-            path = motion._plan_cartesian_move(
-                angles, target_tool, steps, label, carrying=True
-            )
-            self._check_level(path, label)
-            return path
-        except MotionPlanningError as error:
-            original_error = error
-
-        for guess in (angles, np.asarray(motion.robot.q, dtype=float)):
-            try:
-                destination = motion._solve_inverse_kinematics(target_tool, guess, label)
-                count = max(steps, int(np.max(np.abs(destination - angles)) / np.deg2rad(1.5)) + 1)
-                path = jtraj(angles, destination, count).q
-                motion.check_trajectory(path, carrying=True, label=label)
-                self._check_level(path, label)
-                return path
-            except MotionPlanningError:
-                continue
-        raise MotionPlanningError(f'{label}: no safe Cartesian or joint-space route: {original_error}')
-
-    def _orientation_preserving_path(self, start_angles, end_angles, obstacles, label, steps=150):
-        motion = self
-        target_rotation = self.tray_transform(start_angles)[:3, :3]
-        path = []
-        previous_angles = start_angles.copy()
-        for progress in np.linspace(0, 1, steps):
-            smooth = progress * progress * (3 - 2 * progress)
-            angles = previous_angles.copy()
-            angles[:3] = (1 - smooth) * start_angles[:3] + smooth * end_angles[:3]
-
-            def orientation_error(wrist_angles):
-                angles[3:] = wrist_angles
-                actual_rotation = self.tray_transform(angles)[:3, :3]
-                return Rotation.from_matrix(target_rotation @ actual_rotation.T).as_rotvec()
-
-            solution = least_squares(
-                orientation_error, previous_angles[3:],
-                bounds=(motion.lower[3:] + 1e-6, motion.upper[3:] - 1e-6),
-                max_nfev=90
-            )
-            angles[3:] = solution.x
-            if np.linalg.norm(orientation_error(angles[3:])) > np.deg2rad(0.5):
-                raise MotionPlanningError(f'{label}: could not keep the tray square and level')
-            if np.max(np.abs(angles - previous_angles)) > np.deg2rad(10):
-                raise MotionPlanningError(f'{label}: discontinuity in joint movement')
-            collision = motion.check_collision(angles, carrying=True, obstacles=obstacles)
-            if collision is not None:
-                raise MotionPlanningError(f'{label}: {collision}')
-            path.append(angles.copy())
-            previous_angles = angles.copy()
-        return np.asarray(path)
-
-    def _plan_handover_approach(self, front_angles, old_obstacles, extra_obstacles):
-        motion = self
-        start_tray = self.tray_transform(front_angles)
-        failures = []
-        for clearance_height in (1.42,):
-            target = start_tray.copy()
-            target[:3, 3] = (HANDOVER_X, HANDOVER_Y, clearance_height)
-            tool_target = self.tray_target_to_tool(target)
-            for guess in (
-                front_angles,
-                np.deg2rad([87, 1, -79, 89, -88, -81]),
-            ):
-                try:
-                    destination_angles = motion._solve_inverse_kinematics(
-                        tool_target, guess, 'handover clearance pose'
-                    )
-                    over_box = self._orientation_preserving_path(
-                        front_angles, destination_angles, old_obstacles + extra_obstacles,
-                        'swing-back to handover box'
-                    )
-                    motion.obstacles = old_obstacles + extra_obstacles[1:]
-                    final_target = self.tray_transform(over_box[-1]).copy()
-                    final_target[:3, 3] = (HANDOVER_X, HANDOVER_Y, HANDOVER_HEIGHT)
-                    descent = motion._plan_cartesian_move(
-                        over_box[-1], self.tray_target_to_tool(final_target),
-                        85, 'lower tray onto handover box', carrying=True
-                    )
-                    self._check_level(descent, 'handover lowering')
-                    return [over_box, descent]
-                except MotionPlanningError as error:
-                    failures.append(str(error))
-                finally:
-                    motion.obstacles = old_obstacles + extra_obstacles
-        raise MotionPlanningError('No safe swing-back handover route: ' + '; '.join(failures))
-
-    def _check_glass_access(self):
-        robot_pose = self.ur3.base
-        robot_origin = np.asarray(robot_pose.A if hasattr(robot_pose, 'A') else robot_pose)[:3, 3]
-        z_glasses = HANDOVER_HEIGHT + 0.042 + 0.028 + 0.15
-        glass_positions = [
-            (HANDOVER_X + x, HANDOVER_Y + y, z_glasses)
-            for x in (-0.118, 0.0, 0.118)
-            for y in (-0.118, 0.0, 0.118)
-        ]
-        max_distance = max(np.linalg.norm(np.asarray(point) - robot_origin)
-                           for point in glass_positions)
-        if max_distance > 0.51:
-            raise MotionPlanningError(
-                f'UR3e too far from handover glasses: {max_distance:.3f} m'
-            )
-
-    def handover(self):
-        if self.ur3 is None:
-            raise MotionPlanningError('UR3e robot required for tray handover')
-        motion = self
-        if not motion.carrying_tray or not motion.wash_complete:
-            raise MotionPlanningError('The Kawasaki must first collect the washed tray')
-        if motion.tray_offset_from_wrist is None:
-            raise MotionPlanningError('No tray-to-wrist transform available')
-
-        self._check_glass_access()
-        old_obstacles = list(motion.obstacles)
-        extra_obstacles = [
-            self.add_obstacle('handover platform',
-                              (HANDOVER_X, HANDOVER_Y, HANDOVER_HEIGHT / 2),
-                              (HANDOVER_SIZE_X, HANDOVER_SIZE_Y, HANDOVER_HEIGHT)),
-            self.add_obstacle('UR3e lower worktop',
-                              (0, 1.0, 0.975), (2.20, 0.75, 0.05)),
-            self.add_obstacle('UR3e upper bar',
-                              (0, 1.25, 1.275), (2.20, 0.25, 0.05)),
-            self.add_obstacle('UR3e parked pedestal',
-                              np.asarray(self.ur3.base.A)[:3, 3] + [0, 0, 0.14],
-                              (0.17, 0.17, 0.28)),
-            self.add_obstacle('UR3e parked arm',
-                              np.asarray(self.ur3.base.A)[:3, 3] + [0.28, 0, 0.16],
-                              (0.70, 0.18, 0.24)),
-        ]
-        motion.obstacles = old_obstacles + extra_obstacles
-
-        try:
-            current_angles = np.asarray(motion.robot.q, dtype=float).copy()
-            start_angles = current_angles.copy()
-            start_angles[0] = float(np.clip(
-                start_angles[0], self.lower[0] + np.deg2rad(1),
-                self.upper[0] - np.deg2rad(1)
-            ))
-            preparation_path = jtraj(current_angles, start_angles, 15).q
-            motion.check_trajectory(preparation_path, carrying=True,
-                                    label='move clear of base joint limit')
-            raised_tray_height = 1.325
-            present_height = self.tray_transform(start_angles)[2, 3]
-            if present_height >= raised_tray_height:
-                raise_path = np.asarray([start_angles])
-            else:
-                goal = motion.tool_pose(start_angles)
-                goal[:3, 3] += [0, 0, raised_tray_height - present_height]
-                raise_path = motion._plan_cartesian_move(
-                    start_angles, goal, 72, 'raise clean tray over bar', carrying=True
-                )
-
-            raised_angles = raise_path[-1].copy()
-            front_angles = raised_angles.copy()
-            front_angles[0] = 0.0
-            swivel_path = jtraj(raised_angles, front_angles, 135).q
-            motion.check_trajectory(swivel_path, carrying=True,
-                                    label='move around to UR3e station')
-            self._check_level(swivel_path, 'swivel to UR3e')
-
-            handover_paths = self._plan_handover_approach(
-                front_angles, old_obstacles, extra_obstacles
-            )
-            lowering_path = handover_paths[-1]
-
-            self._check_level(preparation_path, 'initial clearance')
-            self._check_level(raise_path, 'raising')
-            for index, path in enumerate(handover_paths):
-                self._check_level(path, f'handover segment {index + 1}')
-
-            final_pose = self.tray_transform(lowering_path[-1])
-            if np.linalg.norm(final_pose[:3, 3] -
-                              [HANDOVER_X, HANDOVER_Y, HANDOVER_HEIGHT]) > 0.004:
-                raise MotionPlanningError('Tray cannot be positioned on the handover box')
-            tray_heading = np.arctan2(final_pose[1, 0], final_pose[0, 0])
-            square_error = abs((tray_heading + np.pi / 4) % (np.pi / 2) - np.pi / 4)
-            if square_error > np.deg2rad(1):
-                raise MotionPlanningError('Tray is not square to the handover box')
-
-            placed_obstacles = motion._build_obstacles(tray_position=final_pose[:3, 3])
-            motion.obstacles = placed_obstacles + extra_obstacles[1:]
-            final_angles = lowering_path[-1].copy()
-            withdrawal_pose = motion.tool_pose(final_angles)
-            withdrawal_pose[:3, 3] -= 0.34 * (
-                motion.wrist_pose(final_angles) @ FORK_MOUNT.A
-            )[:3, 1]
-            try:
-                withdrawal_path = motion._plan_cartesian_move(
-                    final_angles, withdrawal_pose, 65, 'withdraw forks from clean tray'
-                )
-            except MotionPlanningError as error:
-                if 'tray' not in str(error):
-                    raise
-                motion.obstacles = [obstacle for obstacle in placed_obstacles if not obstacle[3]] + extra_obstacles[1:]
-                withdrawal_path = motion._plan_cartesian_move(
-                    final_angles, withdrawal_pose, 65, 'withdraw forks from clean tray'
-                )
-            motion.obstacles = old_obstacles + extra_obstacles
-
-            for path in (preparation_path, raise_path, swivel_path,
-                         *handover_paths):
-                motion._animate_path(path, carrying=True)
-
-            motion.scene.set_tray_pose(SE3(final_pose))
-            motion.carrying_tray = False
-            motion.tray_placed = True
-            motion.tray_offset_from_wrist = None
-            motion.obstacles = motion._build_obstacles(
-                tray_position=final_pose[:3, 3]
-            ) + extra_obstacles[1:]
-            motion._animate_path(withdrawal_path)
-            self.send_tray()
-            return final_pose
-        except Exception:
-            motion.obstacles = old_obstacles
-            raise
+        self.change_state("DISHWASHER_CYCLE")

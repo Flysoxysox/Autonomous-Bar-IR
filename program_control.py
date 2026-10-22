@@ -1,8 +1,5 @@
-"""Shared pendant actions and program state."""
-
 import numpy as np
 from spatialmath import SE3
-
 
 class ProgramControl:
     def __init__(self, ur3_controller, tray_controller, robots):
@@ -18,7 +15,7 @@ class ProgramControl:
 
     @property
     def manual_enabled(self):
-        # stop cancels automatic playback before manual jogging is allowed
+        
         return self.stopped and self.ur3.state == "STOPPED" and self.kawasaki.stopped
 
     @property
@@ -31,7 +28,7 @@ class ProgramControl:
     def jog_pose(self, q=None):
         robot = self.selected_robot
         q = robot.q if q is None else q
-        # the kawasaki uses its visual wrist and fork transforms
+        
         if self.selected_robot_index == 1:
             return SE3(self.kawasaki.tool_pose(q))
         return robot.fkine(q)
@@ -45,7 +42,7 @@ class ProgramControl:
         if not self.manual_enabled:
             return
         robot = self.selected_robot
-        # use each robot's setter so its meshes follow the joint positions
+        
         if hasattr(robot, "set_joint_angles"):
             robot.set_joint_angles(q)
         else:
@@ -62,7 +59,7 @@ class ProgramControl:
                 self.ur3.held_glass_axes.T = pose.A
 
     def toggle_pause(self):
-        # pausing keeps the current trajectory and grasp for a later resume
+        
         if not self.stopped:
             self.paused = not self.paused
 
@@ -71,17 +68,16 @@ class ProgramControl:
             self.ur3.request_beer()
 
     def deposit_dirty_glass(self):
-        # remember deposits until a dirty-glass handling routine is available
+        
         if not self.stopped:
             self.dirty_glasses_pending += 1
 
     def stop(self):
-        # latch the stop so queued orders cannot restart any robot
+        
         self.stopped = True
         self.paused = False
         self.ur3.stop()
-        self.kawasaki.stopped = True
-        self.kawasaki.state = "STOPPED"
+        self.kawasaki.stop()
         for robot in self.robots:
             robot.qd = np.zeros(robot.n)
             robot.qdd = np.zeros(robot.n)
