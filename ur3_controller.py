@@ -15,7 +15,7 @@ from spatialmath import SE3
 
 
 class UR3Controller:
-    """Simple pickup state machine; the workcell owns the simulation loop."""
+    """Queue beer orders and serve them after the tray handoff."""
 
     def __init__(self, ur3, dt=0.02):
         self.ur3 = ur3
@@ -37,15 +37,17 @@ class UR3Controller:
         # lift the filled cup five centimetres along world z after grasping it
         self.beer_lift_height = 0.05
         # this is the final cup origin position in world coordinates in metres
-        self.beer_target_position = np.array([0.3, 1.0, 1.3])
+        self.beer_target_position = np.array([0.45, 1.2, 1.3])
         # increase this time in seconds to make the straight beer movement slower
-        self.beer_move_time = 5.0
-        # turn the upright cup about world z to give the wrist room around the shoulder
-        self.beer_turn_angle = np.pi / 2
+        self.beer_move_time = 2.5
 
         self.glasses = {}
         self.glass_positions = np.ones((3, 3), dtype=bool)
-        self.selected_glass = (1, 1)
+        self.selected_glass = (2, 0)
+        self.tray_ready = False
+        self.pending_beers = 0
+        self.total_beer_requests = 0
+
         # the grip point is five centimetres from the cup origin along cup local z
         self.tr_cup_grip = SE3.Tz(0.05)
         # the imaginary gripper centre is five centimetres along end effector local z
@@ -210,15 +212,7 @@ class UR3Controller:
             self.next_state = "RELEASE_GLASS"
 
         elif new_state == "RELEASE_GLASS":
-            # remember the actual placement posture and cup offset before releasing it
-            self.placed_glass = self.held_glass
-            self.placed_glass_axes = self.held_glass_axes
-            self.tr_ee_placed_glass = SE3(self.tr_ee_held_glass)
-            self.q_placed_glass = self.ur3.q.copy()
-            # releasing stops the cup following the wrist so it stays at its placed pose
-            self.held_glass = None
-            self.held_glass_axes = None
-            self.tr_ee_held_glass = None
+            self._release_glass()
             self.next_state = "RETREAT_FROM_CUP"
 
         elif new_state == "RETREAT_FROM_CUP":
@@ -241,8 +235,9 @@ class UR3Controller:
             self.tr_handle_grasp = self.tap.fkine(self.tap.q) * self.tr_handle_ee
             # stop five centimetres before contact along the gripper approach direction
             ee_goal = self.tr_handle_grasp * SE3.Tz(-0.05)
+            q0 = np.deg2rad([56.1, -179.5, 83.1, -83.6, 33.9, -61.5])
             solution = self.ur3.ikine_LM(
-                ee_goal, q0=self.ur3.q, joint_limits=True,
+                ee_goal, q0=q0, joint_limits=True,
             )
             if not solution.success:
                 self.state = "ERROR"
@@ -335,10 +330,13 @@ class UR3Controller:
             self.next_state = "MOVE_BEER_TO_TARGET"
 
         elif new_state == "MOVE_BEER_TO_TARGET":
-            # keep the cup upright while turning it about the world vertical axis
-            cup_start = self.ur3.fkine(self.ur3.q) * self.tr_ee_held_glass
-            cup_rotation = SE3.Rz(self.beer_turn_angle).R @ cup_start.R
-            cup_goal = SE3.Rt(cup_rotation, self.beer_target_position)
+            # Final EE axes: X points up, Y along world X, Z along world +Y.
+            ee_rotation = (SE3.Rz(-np.pi / 2) * SE3.Ry(-np.pi / 2)).R
+            # Keep the actual grasp offset when converting EE rotation to cup rotation.
+            cup_rotation = ee_rotation @ self.tr_ee_held_glass.R
+            self.tr_beer_target = SE3.Rt(cup_rotation, self.beer_target_position)
+            # Derive the approach from the final cup pose using world -Y and +Z.
+            self.tr_beer_approach = SE3(0, -0.13, 0.02) * self.tr_beer_target
             if not np.isfinite(self.beer_move_time) or self.beer_move_time <= 0:
                 self.state = "ERROR"
                 raise ValueError("Beer movement time must be positive and finite")
@@ -346,8 +344,25 @@ class UR3Controller:
             steps = int(np.ceil(self.beer_move_time / self.dt)) + 1
             # build the straight ctraj path for the cup rather than the wrist
             self.trajectory = self.plan_rmrc(
-                cup_goal, steps=steps, tool_offset=self.tr_ee_held_glass,
+                self.tr_beer_approach, steps=steps, tool_offset=self.tr_ee_held_glass,
             )
+            self.next_state = "PLACE_BEER"
+
+        elif new_state == "PLACE_BEER":
+            # Move the cup forwards 10 cm and down 2 cm without changing its rotation.
+            self.trajectory = self.plan_rmrc(
+                self.tr_beer_target, steps=200, tool_offset=self.tr_ee_held_glass,
+            )
+            self.next_state = "RELEASE_BEER"
+
+        elif new_state == "RELEASE_BEER":
+            self._release_glass()
+            self.next_state = "RETREAT_FROM_BEER"
+
+        elif new_state == "RETREAT_FROM_BEER":
+            # Right multiplication retreats along the EE's own negative Z axis.
+            ee_goal = self.ur3.fkine(self.ur3.q) * SE3.Tz(-0.05)
+            self.trajectory = self.plan_rmrc(ee_goal, steps=100)
             self.next_state = "IDLE"
 
 
@@ -369,6 +384,16 @@ class UR3Controller:
                 self.trajectory = None
                 self.state = "ERROR"
                 raise RuntimeError(f"{new_state} trajectory exceeds joint limits")
+
+    def _release_glass(self):
+        """Save the placed pose and stop the glass following the wrist."""
+        self.placed_glass = self.held_glass
+        self.placed_glass_axes = self.held_glass_axes
+        self.tr_ee_placed_glass = SE3(self.tr_ee_held_glass)
+        self.q_placed_glass = self.ur3.q.copy()
+        self.held_glass = None
+        self.held_glass_axes = None
+        self.tr_ee_held_glass = None
 
     def plan_rmrc(self, target_pose, steps=100, q_start=None, tool_offset=None):
         """Plan joint samples using Cartesian velocity and the world Jacobian."""
@@ -406,7 +431,7 @@ class UR3Controller:
 
             # damping limits very large joint velocities near a singularity
             if m < self.min_manip_measure:
-                damping = 0.001
+                damping = 0.01
                 qdot = linalg.solve(
                     J.T @ J + damping**2 * np.eye(self.ur3.n), J.T @ xdot,
                 )
@@ -482,6 +507,28 @@ class UR3Controller:
 
         return q_matrix
 
+    def request_beer(self):
+        """Remember one order; update() starts it after the tray arrives."""
+        if self.state == "STOPPED":
+            return
+        self.pending_beers += 1
+        self.total_beer_requests += 1
+
+    def stop(self):
+        # cancel playback and keep the controller stopped until restart
+        self.state = self.next_state = "STOPPED"
+        self.trajectory = None
+        self.tap_angles = None
+
+    def _next_available_glass(self):
+        """Nearest row first; columns run from right to left."""
+        for row in (2, 1, 0):
+            for column in range(3):
+                cell = (row, column)
+                if cell in self.glasses and self.glass_positions[cell]:
+                    return cell
+        return None
+
     def pick_glass(self):
         """Start pickup; the approach branch defines its own q0 guess."""
         if self.state != "IDLE":
@@ -492,6 +539,16 @@ class UR3Controller:
 
     def update(self, dt, world=None):
         """Execute one sample when due; the caller steps Swift separately."""
+        if self.state == "STOPPED":
+            return
+        if (self.state == "IDLE" and self.tray_ready
+                and self.pending_beers > 0 and self.held_glass is None):
+            cell = self._next_available_glass()
+            if cell is not None:
+                self.selected_glass = cell
+                self.pick_glass()
+                self.pending_beers -= 1
+
         if self.state not in ("IDLE", "ERROR"):
             if self.trajectory is None:
                 # waiting uses simulation time so the display remains responsive
@@ -522,12 +579,13 @@ class UR3Controller:
                 self.held_glass_axes.T = self.held_glass.T
 
     def receive_tray(self, tr_tray, glass_positions):
-        """Store the tray pose and a 3 x 3 mask of available glasses."""
+        """Confirm handoff and store the tray pose and 3 x 3 availability mask."""
         positions = np.array(glass_positions, dtype=bool, copy=True)
         if positions.shape != (3, 3):
             raise ValueError("glass_positions must be a 3 x 3 availability mask")
         self.tr_tray = SE3(tr_tray)
         self.glass_positions = positions
+        self.tray_ready = True
 
     def recieve_tray(self, tr_tray, glass_positions):
         """Keep the original spelling working for existing callers."""

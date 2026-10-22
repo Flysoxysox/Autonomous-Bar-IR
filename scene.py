@@ -10,7 +10,7 @@ CONVEYOR_HEIGHT = 1.00
 PEDESTAL_HEIGHT = 0.35
 
 HANDOVER_X = 0.48
-HANDOVER_Y = 0.405
+HANDOVER_Y = 0.305
 HANDOVER_SIZE_X = 0.44
 HANDOVER_SIZE_Y = 0.43
 HANDOVER_HEIGHT = 1.00
@@ -81,6 +81,7 @@ class GlassTrayWorkcell:
 
     def __init__(self, simulator, robot):
         self.simulator = simulator
+        self.step_callback = None
         self.robot = robot
         self.tray_pose = SE3(0, BAR_Y, BAR_HEIGHT)
         self.tray_objects = []
@@ -274,5 +275,8 @@ class GlassTrayWorkcell:
             self.door_fraction = float(fraction)
             self.door.T = SE3(DISHWASHER_FRONT_X, CONVEYOR_VISUAL_Y,
                               DOOR_CLOSED_CENTRE + DOOR_RISE * self.door_fraction).A
-            self.simulator.step(step_time)
+            if self.step_callback is not None:
+                self.step_callback(step_time)
+            else:
+                self.simulator.step(step_time)
         self.door_open = bool(opened)

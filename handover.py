@@ -8,7 +8,7 @@ from pickup import MotionPlanningError
 from scene import (
     HANDOVER_X, HANDOVER_Y, HANDOVER_HEIGHT,
     HANDOVER_SIZE_X, HANDOVER_SIZE_Y,
-    FORK_MOUNT, RUNNER_HEIGHT, DECK_THICKNESS, GLASS_ORIGIN_ABOVE_DECK,
+    FORK_MOUNT,
 )
 
 
@@ -21,14 +21,12 @@ class TrayHandover:
     def send_tray(self):
         if self.receiving_controller is None:
             return
-        height = RUNNER_HEIGHT + DECK_THICKNESS + GLASS_ORIGIN_ABOVE_DECK
-        glass_positions = np.array([
-            [x, y, height]
-            for x in (-0.118, 0.0, 0.118)
-            for y in (-0.118, 0.0, 0.118)
-        ], dtype=float)
-        tray_pose = SE3(self.controller.scene.tray_pose.A.copy())
-        self.receiving_controller.recieve_tray(tray_pose, glass_positions)
+        scene = self.controller.scene
+        available = np.zeros((3, 3), dtype=bool)
+        for cell, glass in scene.glasses.items():
+            available[cell] = any(shape is glass for shape, _ in scene.tray_objects)
+        tray_pose = SE3(scene.tray_pose.A.copy())
+        self.receiving_controller.receive_tray(tray_pose, available)
 
     def tray_transform(self, angles):
         motion = self.controller
@@ -159,22 +157,6 @@ class TrayHandover:
                     motion.obstacles = old_obstacles + extra_obstacles
         raise MotionPlanningError('No safe swing-back handover route: ' + '; '.join(failures))
 
-    def _check_glass_access(self):
-        robot_pose = self.ur3.base
-        robot_origin = np.asarray(robot_pose.A if hasattr(robot_pose, 'A') else robot_pose)[:3, 3]
-        z_glasses = HANDOVER_HEIGHT + 0.042 + 0.028 + 0.15
-        glass_positions = [
-            (HANDOVER_X + x, HANDOVER_Y + y, z_glasses)
-            for x in (-0.118, 0.0, 0.118)
-            for y in (-0.118, 0.0, 0.118)
-        ]
-        max_distance = max(np.linalg.norm(np.asarray(point) - robot_origin)
-                           for point in glass_positions)
-        if max_distance > 0.51:
-            raise MotionPlanningError(
-                f'UR3e too far from handover glasses: {max_distance:.3f} m'
-            )
-
     def run(self):
         motion = self.controller
         if not motion.carrying_tray or not motion.wash_complete:
@@ -182,7 +164,6 @@ class TrayHandover:
         if motion.tray_offset_from_wrist is None:
             raise MotionPlanningError('No tray-to-wrist transform available')
 
-        self._check_glass_access()
         old_obstacles = list(motion.obstacles)
         extra_obstacles = [
             self.add_obstacle('handover platform',
@@ -249,26 +230,6 @@ class TrayHandover:
             if square_error > np.deg2rad(1):
                 raise MotionPlanningError('Tray is not square to the handover box')
 
-            placed_obstacles = motion._build_obstacles(tray_position=final_pose[:3, 3])
-            motion.obstacles = placed_obstacles + extra_obstacles[1:]
-            final_angles = lowering_path[-1].copy()
-            withdrawal_pose = motion.tool_pose(final_angles)
-            withdrawal_pose[:3, 3] -= 0.34 * (
-                motion.wrist_pose(final_angles) @ FORK_MOUNT.A
-            )[:3, 1]
-            try:
-                withdrawal_path = motion._plan_cartesian_move(
-                    final_angles, withdrawal_pose, 65, 'withdraw forks from clean tray'
-                )
-            except MotionPlanningError as error:
-                if 'tray' not in str(error):
-                    raise
-                motion.obstacles = [obstacle for obstacle in placed_obstacles if not obstacle[3]] + extra_obstacles[1:]
-                withdrawal_path = motion._plan_cartesian_move(
-                    final_angles, withdrawal_pose, 65, 'withdraw forks from clean tray'
-                )
-            motion.obstacles = old_obstacles + extra_obstacles
-
             for path in (preparation_path, raise_path, swivel_path,
                          *handover_paths):
                 motion._animate_path(path, carrying=True)
@@ -280,7 +241,7 @@ class TrayHandover:
             motion.obstacles = motion._build_obstacles(
                 tray_position=final_pose[:3, 3]
             ) + extra_obstacles[1:]
-            motion._animate_path(withdrawal_path)
+            # leave the forks in the placed tray while the ur3 serves
             self.send_tray()
             return final_pose
         except Exception:

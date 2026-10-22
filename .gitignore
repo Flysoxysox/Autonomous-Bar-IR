@@ -4,3 +4,7 @@ __pycache__/
 simulation_error.log
 test_ur3_pickup.py
 test_ur3_tap.py
+test_beer_placement.py
+test_program_control.py
+test_teach_pendant.py
+test_beer_requests.py

@@ -21,7 +21,7 @@ from scene import (
 
 PICKUP_ANGLES_DEGREES = [0, 22, -79, 0, 10, 0]
 STEP_TIME = 0.005
-DISPLAY_EVERY = 12
+DISPLAY_EVERY = 1
 
 PICKUP_HEIGHT_CORRECTION = 0.012
 PICKUP_BACKOFF = 0.015
@@ -32,9 +32,16 @@ TRAY_LIFT = 0.055
 class MotionPlanningError(Exception):
     pass
 
+class MotionStopped(Exception):
+    pass
+
 class TrayController:
     def __init__(self, robot, scene, simulator):
         self.robot, self.scene, self.simulator = robot, scene, simulator
+        self.state = "IDLE"
+        self.stopped = False
+        self.on_step = None
+        self.pause_requested = None
         self.carrying_tray = False
         self.tray_placed = False
         self.conveyor_finished = False
@@ -281,6 +288,25 @@ class TrayController:
             trajectory.append(joint_angles.copy())
         return np.asarray(trajectory)
 
+    def wait_if_paused(self):
+        # keep the gui alive without advancing the saved robot trajectory
+        while self.pause_requested is not None and self.pause_requested():
+            if self.stopped:
+                raise MotionStopped()
+            if self.on_step is not None:
+                self.on_step()
+            self.simulator.step(STEP_TIME)
+        if self.stopped:
+            raise MotionStopped()
+
+    def step_simulation(self, dt=STEP_TIME):
+        # check pause and stop before and after processing gui events
+        self.wait_if_paused()
+        if self.on_step is not None:
+            self.on_step()
+        self.simulator.step(dt)
+        self.wait_if_paused()
+
     def _animate_path(self, joint_path, carrying=False):
         if len(joint_path) == 0:
             return
@@ -288,12 +314,13 @@ class TrayController:
         if frame_indices[-1] != len(joint_path) - 1:
             frame_indices.append(len(joint_path) - 1)
         for index in frame_indices:
+            self.wait_if_paused()
             joint_angles = joint_path[index]
             self.robot.set_joint_angles(joint_angles)
             self.scene.update_fork()
             if carrying:
                 self.scene.set_tray_pose(SE3(self.wrist_pose(joint_angles) @ self.tray_offset_from_wrist))
-            self.simulator.step(STEP_TIME)
+            self.step_simulation()
 
     def pickup(self):
         if self.tray_placed:
@@ -512,7 +539,7 @@ class TrayController:
             self.scene.set_blue_button_pressed(True)
         else:
             self.scene.set_button_pressed(True)
-        self.simulator.step(STEP_TIME)
+        self.step_simulation()
         return release
 
     def _release_button(self, name, release):
@@ -521,7 +548,7 @@ class TrayController:
             self.scene.set_blue_button_pressed(False)
         else:
             self.scene.set_button_pressed(False)
-        self.simulator.step(STEP_TIME)
+        self.step_simulation()
         self.obstacles = self._build_obstacles()
 
     def toggle_door(self, open_door):
@@ -567,19 +594,20 @@ class TrayController:
             pose = start.copy()
             pose[0,3] = start[0,3]*(1-smooth) + target_x*smooth
             self.scene.set_tray_pose(SE3(pose))
-            self.simulator.step(STEP_TIME)
+            self.step_simulation()
         self.obstacles = self._build_obstacles()
         self._release_button('green', release)
         self.conveyor_finished = forward
         print('Conveyor stopped. Green button released.')
 
     def wash(self):
-        import time
         if not self.scene.door_open or abs(self.scene.tray_pose.t[0] - CONVEYOR_TRAVEL_DISTANCE) > .01:
             raise MotionPlanningError('Tray must be inside dishwasher with door open before washing')
         self.toggle_door(False)
         print('Dishwasher closed. Washing for 2 seconds...')
-        time.sleep(2)
+        # keep processing the stop button while the dishwasher waits
+        for _ in range(int(2.0 / STEP_TIME)):
+            self.step_simulation()
         self.washed = True
         self.toggle_door(True)
         print('Dishwasher open. Ready to return tray.')
