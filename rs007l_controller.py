@@ -2,7 +2,6 @@ from math import pi
 
 import numpy as np
 import roboticstoolbox as rtb
-from scipy.optimize import least_squares
 from scipy.spatial.transform import Rotation
 from spatialmath import SE3
 
@@ -282,15 +281,20 @@ class RS007LController:
 
         safe_minimum = self.lower + 1e-5
         safe_maximum = self.upper - 1e-5
-        def residual(joint_angles):
-            pose_error = self._tool_pose_error(joint_angles, target)
-            return np.r_[3*pose_error[:3], pose_error[3:]]
-        solution = least_squares(residual, np.clip(starting_guess, safe_minimum, safe_maximum),
-                               bounds=(safe_minimum, safe_maximum), max_nfev=400)
-        pose_error = self._tool_pose_error(solution.x, target)
+        guess = np.clip(starting_guess, safe_minimum, safe_maximum)
+        # Convert the fork tool target into a wrist target for the DH model.
+        fork_offset = FORK_MOUNT * SE3(0, 0.24, -0.025)
+        wrist_target = SE3(target) * fork_offset.inv()
+        solution = self.robot.ikine_LM(
+            wrist_target, q0=guess, joint_limits=True,
+            ilimit=400, slimit=1,
+        )
+        if not solution.success:
+            raise MotionPlanningError(f'{label}: IK failed: {solution.reason}')
+        pose_error = self._tool_pose_error(solution.q, target)
         if np.linalg.norm(pose_error[:3]) > .002 or np.linalg.norm(pose_error[3:]) > np.deg2rad(1):
             raise MotionPlanningError(f'{label}: IK could not reach desired tool pose')
-        return solution.x
+        return solution.q
 
     def _fork_tip_position(self, joint_angles, prong=0):
 
@@ -319,14 +323,24 @@ class RS007LController:
         home = np.zeros(6)
         for guess in guesses:
             guess = np.clip(guess, lower, upper)
-
-            def error(q):
-                return np.r_[4*(self._fork_tip_position(q) - goal),
-                             .9*(self._fork_direction(q) - downward_direction),
-                             .003*(q-guess)]
-
-            result = least_squares(error, guess, bounds=(lower, upper), max_nfev=250)
-            q = result.x
+            # Keep the fork's orientation close to the guess while pointing down.
+            fork_frame = self.wrist_pose(guess) @ FORK_MOUNT.A
+            alignment, _ = Rotation.align_vectors(
+                [downward_direction], [fork_frame[:3, 1]]
+            )
+            target_rotation = alignment.as_matrix() @ fork_frame[:3, :3]
+            fork_tip_offset = SE3(
+                FORK_X_POSITIONS[0], 0.065 + FORK_LENGTH, -0.025
+            )
+            target_fork_frame = SE3.Rt(target_rotation, goal) * fork_tip_offset.inv()
+            wrist_target = target_fork_frame * FORK_MOUNT.inv()
+            solution = self.robot.ikine_LM(
+                wrist_target, q0=guess, joint_limits=True,
+                ilimit=400, slimit=1,
+            )
+            if not solution.success:
+                continue
+            q = solution.q
             if np.linalg.norm(self._fork_tip_position(q) - goal) > .0025:
                 continue
             if self._fork_direction(q)[2] > -np.cos(np.deg2rad(3)):
